@@ -13,6 +13,14 @@ protocol BuddyStreamingTranscriptionSession: AnyObject {
     func appendAudioBuffer(_ audioBuffer: AVAudioPCMBuffer)
     func requestFinalTranscript()
     func cancel()
+
+    /// Optional observer the provider calls whenever its underlying
+    /// model declares an end-of-turn — i.e. the speaker has stopped
+    /// talking. Only streaming providers with native turn detection
+    /// (AssemblyAI) implement this; upload-based providers (OpenAI,
+    /// Apple Speech) leave it as a no-op. Used by wake-word dictation
+    /// flows to auto-close the turn without a press/release gesture.
+    var onTurnEndedByProvider: (() -> Void)? { get set }
 }
 
 protocol BuddyTranscriptionProvider {

@@ -62,15 +62,66 @@ final class CompanionManager: ObservableObject {
     private var onboardingMusicPlayer: AVAudioPlayer?
     private var onboardingMusicFadeTimer: Timer?
 
+    // MARK: - Startup Audio
+
+    /// Quiet background music that plays once when the cursor overlay
+    /// first appears on a regular (post-onboarding) launch.
+    private var startupBackgroundMusicPlayer: AVAudioPlayer?
+
+    /// Timer that fades out the startup BGM shortly after it begins so
+    /// the bed doesn't overstay its welcome.
+    private var startupBackgroundMusicFadeTimer: Timer?
+
+    /// Short Koko "kookoo" voice jingle that plays on top of the startup
+    /// BGM so the bird has an audible arrival alongside its intro flight.
+    private var startupKookooIntroPlayer: AVAudioPlayer?
+
+    let kokoSoundEffects = KokoSoundEffects()
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
+    /// System-wide Option+Space hotkey that toggles the inline typed input
+    /// overlay next to the bird. Gated behind accessibility permission,
+    /// same as push-to-talk.
+    let globalPanelHotkeyMonitor = GlobalPanelHotkeyMonitor()
+    /// System-wide Ctrl+Shift+T hotkey that toggles text-only mode —
+    /// responses stream into a big scrollable panel next to the bird
+    /// instead of being spoken via ElevenLabs TTS.
+    let globalTextModeHotkeyMonitor = GlobalTextModeHotkeyMonitor()
     let overlayWindowManager = OverlayWindowManager()
+    /// Spotlight-style typed input that appears next to the koyal sprite
+    /// when the user hits Option+Space. Shares its submission pipeline
+    /// with push-to-talk via `submitTypedCommand(_:)`.
+    let typedInputOverlayManager = CompanionTypedInputOverlayManager()
+
+    /// Scrollable streaming text-response panel used when Koko is in
+    /// text-only mode. Sits in the same slot next to the bird as the
+    /// typed input overlay, but is bigger and persists until the user
+    /// clicks away or hits Escape.
+    let textResponseOverlayManager = CompanionTextResponseOverlayManager()
+
+    /// On-device "Hey Koko" wake-word listener. Apple Speech backend
+    /// for now; will be swapped for Porcupine once the license is
+    /// active without any changes to the rest of the manager.
+    let kokoWakeWordListener: any KokoWakeWordListener = AppleSpeechKokoWakeWordListener()
+
+    /// Persistent session memory — stores conversation summaries in
+    /// a human-readable `memory.md` that gets injected into Claude's
+    /// system prompt so Koko remembers things across app launches.
+    let kokoMemoryManager = KokoMemoryManager()
+
+    /// Periodic unprompted screen observations — Koko takes a look
+    /// at the screen every N minutes and comments on something.
+    let kokoProactiveObserver = KokoProactiveObserver()
+
+    /// Nest — after N minutes idle, Koko flies to a corner
+    /// and perches until the user talks to it again.
+    let kokoNest = KokoNest()
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    private static let workerBaseURL = "https://clicky-proxy.ipofmehul.workers.dev"
 
     private lazy var claudeAPI: ClaudeAPI = {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
@@ -88,11 +139,50 @@ final class CompanionManager: ObservableObject {
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
 
+    /// Timestamp of the last Ctrl+Option press, used to detect double-
+    /// press for continuous-listen mode.
+    private var lastShortcutPressedAt: Date?
+
+    /// When true, the current recording was triggered by a double-press
+    /// and should run continuously (with silence auto-stop) instead of
+    /// ending on key release.
+    private var isContinuousListenActive: Bool = false
+
+    /// How quickly two presses must happen to count as a double-press.
+    private static let doublePressThresholdSeconds: TimeInterval = 0.4
+
     private var shortcutTransitionCancellable: AnyCancellable?
+    private var panelHotkeyCancellable: AnyCancellable?
+    private var textModeHotkeyCancellable: AnyCancellable?
+    private var wakeWordDetectionCancellable: AnyCancellable?
+    private var wakeWordLifecycleOnVoiceStateCancellable: AnyCancellable?
+    private var providerReportedTurnEndCancellable: AnyCancellable?
+    /// True while the current dictation session was triggered by the
+    /// wake word (as opposed to Ctrl+Option). Only wake-word sessions
+    /// should auto-close on the provider's turn-end signal — Ctrl+Option
+    /// flows end when the user releases the key.
+    private var isCurrentDictationSessionFromWakeWord: Bool = false
+
+    /// When the current wake-word-triggered dictation session began.
+    /// The provider's end-of-turn signal is ignored during the first
+    /// `wakeWordTurnEndGracePeriodSeconds` after this timestamp so a
+    /// brief pause between "Hey Koko" and the user's actual command
+    /// doesn't close the turn before the command even starts.
+    private var currentWakeWordSessionStartedAt: Date?
+
+    /// How long after a wake-word session starts we ignore the
+    /// provider's end-of-turn signal. Tuned for the real-world
+    /// "Hey Koko, [half-beat], what's on my screen?" cadence.
+    private static let wakeWordTurnEndGracePeriodSeconds: TimeInterval = 2.0
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
+    /// Background task that watches `currentAudioPowerLevel` after a
+    /// wake-word-triggered dictation session starts and auto-stops the
+    /// session once the user has been silent long enough, since wake
+    /// word flows have no press/release gesture to end the turn.
+    private var wakeWordSilenceAutoStopTask: Task<Void, Never>?
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
@@ -107,8 +197,16 @@ final class CompanionManager: ObservableObject {
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
+    /// Koko's current position in macOS screen coordinates (bottom-left
+    /// origin). Updated every frame by `BlueCursorView`'s cursor-tracking
+    /// timer and navigation-flight timer so external panels (typed input,
+    /// text response) can track the bird's *actual* position — not just
+    /// the mouse cursor, which the bird departs from during element-
+    /// pointing flights.
+    @Published var kokoCurrentScreenPosition: CGPoint = .zero
+
     /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-opus-4-7"
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
@@ -122,6 +220,93 @@ final class CompanionManager: ObservableObject {
     @Published var isClickyCursorEnabled: Bool = UserDefaults.standard.object(forKey: "isClickyCursorEnabled") == nil
         ? true
         : UserDefaults.standard.bool(forKey: "isClickyCursorEnabled")
+
+    /// User preference for the always-on "Hey Koko" wake word. Off by
+    /// default because always-listening is a meaningful escalation of
+    /// the app's privacy surface and should be an explicit opt-in.
+    /// Persisted so the choice survives restarts.
+    @Published private(set) var isWakeWordListeningEnabled: Bool =
+        UserDefaults.standard.bool(forKey: "isWakeWordListeningEnabled")
+
+    func setWakeWordListeningEnabled(_ enabled: Bool) {
+        isWakeWordListeningEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "isWakeWordListeningEnabled")
+        refreshWakeWordListenerLifecycle()
+    }
+
+    /// Whether a conversation session is currently active. When the
+    /// user turns this off, conversation history is summarized to
+    /// memory and cleared. Turning it back on starts a fresh session.
+    @Published private(set) var isSessionActive: Bool = true
+
+    func setSessionActive(_ active: Bool) {
+        if isSessionActive && !active {
+            // Session ending — summarize memory, clear history, and
+            // put Koko to sleep (hide overlay, stop all listeners).
+            summarizeSessionToMemory()
+            conversationHistory.removeAll()
+            kokoWakeWordListener.stop()
+            kokoProactiveObserver.stop()
+            kokoNest.stopIdleTimer()
+            buddyDictationManager.cancelCurrentDictation()
+            currentResponseTask?.cancel()
+            currentResponseTask = nil
+            elevenLabsTTSClient.stopPlayback()
+            textResponseOverlayManager.hide()
+            typedInputOverlayManager.hide()
+            overlayWindowManager.hideOverlay()
+            isOverlayVisible = false
+            voiceState = .idle
+            print("🧠 Session ended — Koko is sleeping")
+        } else if !isSessionActive && active {
+            // Session starting — wake Koko up.
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+            refreshWakeWordListenerLifecycle()
+            kokoProactiveObserver.startIfEnabled()
+            kokoNest.startIfEnabled()
+            print("🧠 New session started — Koko is awake")
+        }
+        isSessionActive = active
+    }
+
+    /// Text-only response mode. When true, Claude's response streams
+    /// into a dedicated scrollable text panel next to the bird and
+    /// ElevenLabs TTS is skipped entirely. Toggled by the global
+    /// Ctrl+Shift+T hotkey or the toggle in the menu bar panel.
+    /// Persisted so the choice survives restarts.
+    @Published private(set) var isTextOnlyMode: Bool =
+        UserDefaults.standard.bool(forKey: "isTextOnlyMode")
+
+    func setTextOnlyMode(_ enabled: Bool) {
+        guard isTextOnlyMode != enabled else { return }
+        isTextOnlyMode = enabled
+        UserDefaults.standard.set(enabled, forKey: "isTextOnlyMode")
+        kokoSoundEffects.play(.toggle)
+        // Flipping modes mid-response is fine — the current response
+        // finishes in whatever mode it started in. New responses
+        // pick up the new mode automatically.
+        showTextModeToggleFeedback(enabled: enabled)
+    }
+
+    /// Briefly shows a small confirmation bubble near the bird that
+    /// says "text mode on" / "text mode off" so the toggle has
+    /// *some* visible feedback. Without this the hotkey feels like
+    /// it does nothing.
+    @Published private(set) var textModeToggleFeedbackText: String = ""
+    @Published private(set) var isShowingTextModeToggleFeedback: Bool = false
+    private var textModeToggleFeedbackHideTask: Task<Void, Never>?
+
+    private func showTextModeToggleFeedback(enabled: Bool) {
+        textModeToggleFeedbackText = enabled ? "text mode on" : "text mode off"
+        isShowingTextModeToggleFeedback = true
+        textModeToggleFeedbackHideTask?.cancel()
+        textModeToggleFeedbackHideTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(1600))
+            guard !Task.isCancelled, let self else { return }
+            self.isShowingTextModeToggleFeedback = false
+        }
+    }
 
     func setClickyCursorEnabled(_ enabled: Bool) {
         isClickyCursorEnabled = enabled
@@ -179,6 +364,13 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        bindPanelHotkeyTransitions()
+        bindTextModeHotkeyTransitions()
+        bindWakeWordDetection()
+        configureTypedInputOverlay()
+        configurePanelPositionProviders()
+        configureProactiveObserver()
+        configureNest()
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
@@ -188,10 +380,98 @@ final class CompanionManager: ObservableObject {
         // were revoked (e.g. signing change), don't show the cursor — the
         // panel will show the permissions UI instead.
         if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
-            overlayWindowManager.hasShownOverlayBefore = true
+            // NOTE: do NOT pre-set `hasShownOverlayBefore` here. The flag
+            // is owned by `OverlayWindowManager.showOverlay`, which reads
+            // it to decide whether this is a first appearance (triggering
+            // Koko's intro flight and welcome bubble). Pre-setting it
+            // suppresses the entrance animation.
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
+            playStartupAudio()
         }
+
+        // Kick off the wake word listener once everything else is wired
+        // up. `refreshWakeWordListenerLifecycle` is a no-op when the
+        // user hasn't opted in or when permissions are missing.
+        refreshWakeWordListenerLifecycle()
+        kokoProactiveObserver.startIfEnabled()
+        kokoNest.startIfEnabled()
+    }
+
+    /// Plays Koko's startup sound stack: a quiet looping BGM plus a short
+    /// "kookoo" voice jingle layered on top, timed to coincide with the
+    /// sprite's intro flight onto the screen.
+    private func playStartupAudio() {
+        playStartupBackgroundMusic()
+        playStartupKookooIntro()
+    }
+
+    private func playStartupBackgroundMusic() {
+        stopStartupBackgroundMusic()
+
+        guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
+            print("⚠️ Koko: ff.mp3 not found in bundle — skipping startup BGM")
+            return
+        }
+
+        do {
+            let player = try AVAudioPlayer(contentsOf: musicURL)
+            // Deliberately quieter than the onboarding BGM (0.3) — this
+            // one is meant to sit *under* the kookoo voice jingle during
+            // the intro flight, not linger behind normal app use.
+            player.volume = 0.12
+            player.numberOfLoops = 0
+            player.play()
+            self.startupBackgroundMusicPlayer = player
+
+            // Fade the BGM out after ~3s so it caps at roughly the same
+            // length as the kookoo voice jingle and then gets out of the
+            // way. Without this the track loops or drones on behind
+            // every interaction until the app quits.
+            startupBackgroundMusicFadeTimer = Timer.scheduledTimer(
+                withTimeInterval: 3.0,
+                repeats: false
+            ) { [weak self] _ in
+                self?.fadeOutStartupBackgroundMusic()
+            }
+        } catch {
+            print("⚠️ Koko: Failed to play startup BGM: \(error)")
+        }
+    }
+
+    private func fadeOutStartupBackgroundMusic() {
+        guard let player = startupBackgroundMusicPlayer else { return }
+
+        let fadeStepCount = 20
+        let fadeDurationSeconds: Double = 0.6
+        let fadeStepInterval = fadeDurationSeconds / Double(fadeStepCount)
+        let volumeDecrementPerStep = player.volume / Float(fadeStepCount)
+        var fadeStepsRemaining = fadeStepCount
+
+        startupBackgroundMusicFadeTimer?.invalidate()
+        startupBackgroundMusicFadeTimer = Timer.scheduledTimer(
+            withTimeInterval: fadeStepInterval,
+            repeats: true
+        ) { [weak self] fadeTimer in
+            fadeStepsRemaining -= 1
+            player.volume = max(player.volume - volumeDecrementPerStep, 0)
+
+            if fadeStepsRemaining <= 0 {
+                fadeTimer.invalidate()
+                self?.stopStartupBackgroundMusic()
+            }
+        }
+    }
+
+    private func stopStartupBackgroundMusic() {
+        startupBackgroundMusicFadeTimer?.invalidate()
+        startupBackgroundMusicFadeTimer = nil
+        startupBackgroundMusicPlayer?.stop()
+        startupBackgroundMusicPlayer = nil
+    }
+
+    private func playStartupKookooIntro() {
+        kokoSoundEffects.play(.kookoo)
     }
 
     /// Called by BlueCursorView after the buddy finishes its pointing
@@ -288,14 +568,38 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        // Summarize the session's conversations into memory before
+        // tearing everything down. Runs synchronously since the app
+        // is about to terminate — there's no "later" to defer to.
+        summarizeSessionToMemory()
+
         globalPushToTalkShortcutMonitor.stop()
+        globalPanelHotkeyMonitor.stop()
+        globalTextModeHotkeyMonitor.stop()
+        kokoWakeWordListener.stop()
+        kokoProactiveObserver.stop()
+        kokoNest.stopIdleTimer()
+        wakeWordSilenceAutoStopTask?.cancel()
+        wakeWordSilenceAutoStopTask = nil
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
+        typedInputOverlayManager.hide()
+        textResponseOverlayManager.hide()
+        textModeToggleFeedbackHideTask?.cancel()
+        textModeToggleFeedbackHideTask = nil
         transientHideTask?.cancel()
+        stopStartupBackgroundMusic()
+        startupKookooIntroPlayer?.stop()
+        startupKookooIntroPlayer = nil
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
         shortcutTransitionCancellable?.cancel()
+        panelHotkeyCancellable?.cancel()
+        textModeHotkeyCancellable?.cancel()
+        wakeWordDetectionCancellable?.cancel()
+        wakeWordLifecycleOnVoiceStateCancellable?.cancel()
+        providerReportedTurnEndCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
         accessibilityCheckTimer?.invalidate()
@@ -313,8 +617,12 @@ final class CompanionManager: ObservableObject {
 
         if currentlyHasAccessibility {
             globalPushToTalkShortcutMonitor.start()
+            globalPanelHotkeyMonitor.start()
+            globalTextModeHotkeyMonitor.start()
         } else {
             globalPushToTalkShortcutMonitor.stop()
+            globalPanelHotkeyMonitor.stop()
+            globalTextModeHotkeyMonitor.stop()
         }
 
         hasScreenRecordingPermission = WindowPositionManager.hasScreenRecordingPermission()
@@ -348,6 +656,12 @@ final class CompanionManager: ObservableObject {
         if !previouslyHadAll && allPermissionsGranted {
             ClickyAnalytics.trackAllPermissionsGranted()
         }
+
+        // Permissions can flip at any time (user revokes in System
+        // Settings, user grants them for the first time, etc.). Make
+        // sure the wake word listener reflects the new state so it
+        // doesn't crash trying to record without mic access.
+        refreshWakeWordListenerLifecycle()
     }
 
     /// Triggers the macOS screen content picker by performing a dummy
@@ -436,8 +750,28 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRecording, isFinalizing, isPreparing in
                 guard let self else { return }
-                // Don't override .responding — the AI response pipeline
-                // manages that state directly until streaming finishes.
+                // Don't override .responding or .processing while the
+                // response pipeline owns the voice state. The pipeline
+                // is responsible for moving state through
+                // processing → responding → idle on its own schedule.
+                // Without this guard the observer would clobber the
+                // pipeline's .processing with .idle the moment the
+                // dictation manager finished finalizing, which in turn
+                // restarts the wake word listener *before* TTS has
+                // even begun playing — and the listener then hears
+                // Koko's own voice coming out of the speakers and
+                // retriggers on "coco" / "koko" mentions in the reply.
+                if self.currentResponseTask != nil {
+                    // Still mirror listening-state transitions *into*
+                    // the pipeline window so the waveform shows up
+                    // while the user is mid-press, but never flip out
+                    // of pipeline-managed states.
+                    if isRecording {
+                        self.voiceState = .listening
+                    }
+                    return
+                }
+
                 guard self.voiceState != .responding else { return }
 
                 if isFinalizing {
@@ -451,12 +785,7 @@ final class CompanionManager: ObservableObject {
                     // If the user pressed and released the hotkey without
                     // saying anything, no response task runs — schedule the
                     // transient hide here so the overlay doesn't get stuck.
-                    // Only do this when no response is in flight, otherwise
-                    // the brief idle gap between recording and processing
-                    // would prematurely hide the overlay.
-                    if self.currentResponseTask == nil {
-                        self.scheduleTransientHideIfNeeded()
-                    }
+                    self.scheduleTransientHideIfNeeded()
                 }
             }
     }
@@ -470,33 +799,711 @@ final class CompanionManager: ObservableObject {
             }
     }
 
+    /// Wires Option+Space to toggle the inline typed-input overlay that
+    /// sits next to the bird. Previously this hotkey opened the menu bar
+    /// panel; now it's a lightweight speech-bubble-style Spotlight field
+    /// that lives on top of whatever app the user is currently using.
+    private func bindPanelHotkeyTransitions() {
+        panelHotkeyCancellable = globalPanelHotkeyMonitor
+            .panelHotkeyPressedPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handlePanelHotkeyPressed()
+            }
+    }
+
+    /// Wires Ctrl+Shift+T to flip text-only response mode on and off.
+    /// The hotkey itself is intentionally minimal — just invert the
+    /// flag, persist it, and show a brief toast. The response pipeline
+    /// reads `isTextOnlyMode` on each new response.
+    private func bindTextModeHotkeyTransitions() {
+        textModeHotkeyCancellable = globalTextModeHotkeyMonitor
+            .textModeHotkeyPressedPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.setTextOnlyMode(!self.isTextOnlyMode)
+            }
+    }
+
+    /// Hooks the typed input overlay's submit callback up to the shared
+    /// voice/typed command pipeline so a typed prompt goes through the
+    /// exact same screenshot + Claude + TTS + pointing flow.
+    private func configureTypedInputOverlay() {
+        typedInputOverlayManager.onSubmit = { [weak self] submittedText in
+            self?.submitTypedCommand(submittedText)
+        }
+    }
+
+    /// Gives both overlay panel managers a closure that returns Koko's
+    /// real-time screen position (published by `BlueCursorView` every
+    /// frame). The panels use this instead of `NSEvent.mouseLocation`
+    /// so they follow the bird even when it flies away from the cursor
+    /// to point at a UI element.
+    private func configurePanelPositionProviders() {
+        let positionProvider: () -> CGPoint = { [weak self] in
+            self?.kokoCurrentScreenPosition ?? NSEvent.mouseLocation
+        }
+        typedInputOverlayManager.kokoScreenPositionProvider = positionProvider
+        textResponseOverlayManager.kokoScreenPositionProvider = positionProvider
+    }
+
+    /// Wires the proactive observer's trigger to a screenshot + Claude
+    /// observation flow. Uses text-only mode for the response since
+    /// proactive comments should appear quietly, not spoken aloud.
+    private func configureProactiveObserver() {
+        kokoProactiveObserver.onObservationTriggered = { [weak self] in
+            self?.performProactiveObservation()
+        }
+    }
+
+    /// Wires the nest callbacks. The actual flight animation
+    /// is triggered via a published position that BlueCursorView
+    /// reads — similar to element pointing but without the bezier arc.
+    private func configureNest() {
+        kokoNest.onShouldNest = { [weak self] targetCornerPosition in
+            guard let self else { return }
+            // Store the perch target so BlueCursorView can fly there.
+            self.nestTargetScreenPosition = targetCornerPosition
+            self.isNesting = true
+            print("🪹 Koko nest: flying to corner (\(Int(targetCornerPosition.x)), \(Int(targetCornerPosition.y)))")
+        }
+        kokoNest.onShouldReturnFromNest = { [weak self] in
+            guard let self else { return }
+            self.isNesting = false
+            self.nestTargetScreenPosition = nil
+            print("🪹 Koko nest: returning to cursor")
+        }
+    }
+
+    /// Performs a proactive screen observation — takes a screenshot
+    /// and sends it to Claude with the observation prompt. Always
+    /// uses text-only display (no TTS) so it's non-intrusive.
+    private func performProactiveObservation() {
+        // Don't interrupt an active interaction.
+        guard !buddyDictationManager.isDictationInProgress else {
+            print("👁️ Proactive observation skipped: dictation in progress")
+            return
+        }
+        guard currentResponseTask == nil else {
+            print("👁️ Proactive observation skipped: response task in flight")
+            return
+        }
+        guard hasCompletedOnboarding, allPermissionsGranted else {
+            print("👁️ Proactive observation skipped: permissions missing")
+            return
+        }
+        print("👁️ Proactive observation: starting")
+
+        // If nested, save the nest position so the bird can return
+        // there after the observation (and optional pointing) finishes.
+        // Pause the idle timer without returning to cursor — the bird
+        // stays at its nest unless the observation points it somewhere.
+        if isNesting, let nestPos = nestTargetScreenPosition {
+            savedNestPosition = nestPos
+            kokoNest.pauseIdleTimerForObservation()
+        }
+
+        kokoSoundEffects.play(.think)
+
+        // Force text-only for proactive observations regardless of
+        // the user's text-mode toggle — spoken unprompted comments
+        // would be jarring.
+        textResponseOverlayManager.beginStreamingResponse()
+        typedInputOverlayManager.hide()
+
+        currentResponseTask = Task { [weak self] in
+            guard let self else { return }
+            self.voiceState = .processing
+
+            do {
+                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                guard !Task.isCancelled else { return }
+
+                let labeledImages = screenCaptures.map { capture in
+                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                    return (data: capture.imageData, label: capture.label + dimensionInfo)
+                }
+
+                // Inject memory if enabled.
+                var observationPrompt = KokoProactiveObserver.observationSystemPrompt
+                let memoryContent = self.kokoMemoryManager.loadMemoryForPrompt()
+                if !memoryContent.isEmpty {
+                    observationPrompt += "\n\nyour memory of past interactions:\n\(memoryContent)"
+                }
+
+                let (fullResponseText, _) = try await self.claudeAPI.analyzeImageStreaming(
+                    images: labeledImages,
+                    systemPrompt: observationPrompt,
+                    conversationHistory: [],
+                    userPrompt: "take a look at my screen and share one quick thought.",
+                    onTextChunk: { [weak self] accumulatedText in
+                        guard let self else { return }
+                        let cleanedText = Self.stripPointingTagFromStreamingText(accumulatedText)
+                        Task { @MainActor in
+                            if self.voiceState != .responding {
+                                self.voiceState = .responding
+                            }
+                            self.textResponseOverlayManager.updateStreamingResponse(text: cleanedText)
+                        }
+                    }
+                )
+
+                guard !Task.isCancelled else { return }
+
+                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
+                let observationText = Self.stripPointingTagFromStreamingText(parseResult.spokenText)
+
+                // Handle pointing if the observation references a UI element.
+                let targetScreenCapture: CompanionScreenCapture? = {
+                    if let screenNumber = parseResult.screenNumber,
+                       screenNumber >= 1 && screenNumber <= screenCaptures.count {
+                        return screenCaptures[screenNumber - 1]
+                    }
+                    return screenCaptures.first(where: { $0.isCursorScreen })
+                }()
+
+                if let pointCoordinate = parseResult.coordinate,
+                   let targetScreenCapture {
+                    let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
+                    let screenshotHeight = CGFloat(targetScreenCapture.screenshotHeightInPixels)
+                    let displayWidth = CGFloat(targetScreenCapture.displayWidthInPoints)
+                    let displayHeight = CGFloat(targetScreenCapture.displayHeightInPoints)
+                    let displayFrame = targetScreenCapture.displayFrame
+
+                    let clampedX = max(0, min(pointCoordinate.x, screenshotWidth))
+                    let clampedY = max(0, min(pointCoordinate.y, screenshotHeight))
+                    let displayLocalX = clampedX * (displayWidth / screenshotWidth)
+                    let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+                    let appKitY = displayHeight - displayLocalY
+
+                    let globalLocation = CGPoint(
+                        x: displayLocalX + displayFrame.origin.x,
+                        y: appKitY + displayFrame.origin.y
+                    )
+
+                    // Use the POINT tag's short label (e.g. "error
+                    // message") for the bubble, not the full observation
+                    // text — that's already in the text response panel.
+                    self.detectedElementBubbleText = parseResult.elementLabel
+                    self.detectedElementScreenLocation = globalLocation
+                    self.detectedElementDisplayFrame = displayFrame
+                    self.kokoSoundEffects.play(.point)
+                }
+
+                self.textResponseOverlayManager.updateStreamingResponse(text: observationText)
+                self.textResponseOverlayManager.finishStreamingResponse()
+
+                // No memory save for proactive observations — they're
+                // noise. Only user-initiated exchanges get remembered.
+
+                self.kokoSoundEffects.play(.done)
+            } catch is CancellationError {
+                self.textResponseOverlayManager.hide()
+            } catch {
+                self.kokoSoundEffects.play(.error)
+                self.textResponseOverlayManager.updateStreamingResponse(
+                    text: "couldn't take a look right now."
+                )
+                self.textResponseOverlayManager.finishStreamingResponse()
+            }
+
+            if !Task.isCancelled {
+                self.voiceState = .idle
+                self.scheduleTransientHideIfNeeded()
+
+                // If nest is enabled and was due, perch now
+                if self.savedNestPosition != nil {
+                    // Was nesting before the observation — isNesting and
+                    // nestTargetScreenPosition are still set (we used
+                    // pauseIdleTimerForObservation, not reset), so the
+                    // bird stays at the nest. If there's an in-flight
+                    // pointing animation, DO NOT clear savedNestPosition
+                    // here — startFlyingBackToCursor needs it to fly
+                    // the bird directly back to the nest after holding.
+                    // savedNestPosition is cleared in the bezier flight
+                    // completion handler when the bird lands at nest.
+                    if self.detectedElementScreenLocation == nil {
+                        // No pointing happened — safe to clear now.
+                        self.savedNestPosition = nil
+                    }
+                    self.kokoNest.resumeIdleTimerAfterObservation()
+                } else if self.kokoNest.isEnabled && !self.isNesting {
+                    // Wasn't nesting — observe then nest after a delay.
+                    try? await Task.sleep(for: .milliseconds(2000))
+                    if !Task.isCancelled && !self.buddyDictationManager.isDictationInProgress {
+                        self.kokoNest.triggerNestNow()
+                    }
+                }
+            }
+            self.currentResponseTask = nil
+        }
+    }
+
+    /// Published state for nesting so BlueCursorView can read it.
+    @Published var isNesting: Bool = false
+    @Published var nestTargetScreenPosition: CGPoint?
+
+    /// Saved nest position when a proactive observation fires while
+    /// nesting. After the observation (and optional pointing) finishes,
+    /// the bird returns to this position instead of the cursor.
+    @Published var savedNestPosition: CGPoint?
+
+    /// Resets all interaction-dependent timers — called on every user
+    /// command (PTT, typed, wake word) so proactive observations and
+    /// nest countdowns restart from zero.
+    private func resetInteractionTimers() {
+        kokoProactiveObserver.resetTimer()
+        kokoNest.resetIdleTimer()
+    }
+
+    // MARK: - Wake Word
+
+    /// Subscribe to the on-device "Hey Koko" wake word listener and
+    /// route detections into the same screenshot + Claude + TTS
+    /// pipeline push-to-talk uses. Also observe `voiceState` so the
+    /// listener can cleanly resume once a full response cycle
+    /// completes (transcription + Claude + TTS + pointing).
+    private func bindWakeWordDetection() {
+        wakeWordDetectionCancellable = kokoWakeWordListener
+            .wakeWordDetectedPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleWakeWordDetection()
+            }
+
+        wakeWordLifecycleOnVoiceStateCancellable = $voiceState
+            .receive(on: DispatchQueue.main)
+            .removeDuplicates()
+            .sink { [weak self] newVoiceState in
+                guard let self, newVoiceState == .idle else { return }
+                // Reset session flags as soon as we're idle so they
+                // don't leak into the next session's classification.
+                self.isCurrentDictationSessionFromWakeWord = false
+                self.currentWakeWordSessionStartedAt = nil
+                self.isContinuousListenActive = false
+                self.refreshWakeWordListenerAfterTTSPlayback()
+            }
+
+        providerReportedTurnEndCancellable = buddyDictationManager
+            .providerReportedTurnEndPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // Only close the session automatically when the wake
+                // word triggered it. Ctrl+Option push-to-talk already
+                // ends on the user's key release — we don't want a
+                // transient early end-of-turn to cut the user off
+                // mid-command on that path.
+                guard self.isCurrentDictationSessionFromWakeWord else { return }
+                guard self.buddyDictationManager.isRecordingFromKeyboardShortcut else { return }
+
+                // Grace period: ignore end-of-turn signals that arrive
+                // in the first couple of seconds. AssemblyAI will
+                // happily declare the turn done during the tiny pause
+                // between "Hey Koko" and the user's actual command,
+                // which would slam the session closed before they've
+                // said anything useful.
+                if let sessionStartedAt = self.currentWakeWordSessionStartedAt,
+                   Date().timeIntervalSince(sessionStartedAt) < Self.wakeWordTurnEndGracePeriodSeconds {
+                    print("🪺 Koko wake word: ignoring early end-of-turn (grace period)")
+                    return
+                }
+
+                print("🪺 Koko wake word: AssemblyAI reported end-of-turn — stopping")
+                self.wakeWordSilenceAutoStopTask?.cancel()
+                self.wakeWordSilenceAutoStopTask = nil
+                self.buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            }
+    }
+
+    /// Waits for any in-flight TTS playback to finish, then refreshes
+    /// the wake word listener lifecycle. Called whenever `voiceState`
+    /// returns to `.idle` so the listener never resumes while Koko's
+    /// own voice is coming out the speakers — otherwise the TTS could
+    /// echo-trigger the wake phrase back at us.
+    ///
+    /// After playback ends, waits an additional short grace period so
+    /// any room echo or speaker-bleed tail can decay before the
+    /// microphone starts listening again. Without this, immediately
+    /// restarting the listener can still pick up the last ~200ms of
+    /// Koko's final syllable as it reverberates in the room.
+    private func refreshWakeWordListenerAfterTTSPlayback() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            // Give the audio player a brief moment to actually start
+            // playing before we decide "it's not playing, refresh now".
+            // Without this, a race where voiceState flips to .idle a
+            // tick before `player.play()` lands would see isPlaying
+            // == false and restart the listener too early.
+            try? await Task.sleep(for: .milliseconds(150))
+            if Task.isCancelled { return }
+
+            while self.elevenLabsTTSClient.isPlaying {
+                try? await Task.sleep(for: .milliseconds(200))
+                if Task.isCancelled { return }
+            }
+
+            // Post-playback echo grace period.
+            try? await Task.sleep(for: .milliseconds(500))
+            if Task.isCancelled { return }
+
+            // Bail if something kicked off another TTS during the
+            // grace period (response interrupted, new command etc.).
+            guard !self.elevenLabsTTSClient.isPlaying else { return }
+
+            self.refreshWakeWordListenerLifecycle()
+        }
+    }
+
+    /// Starts or stops the wake word listener based on whether the
+    /// user has opted in AND we're in a state where taking over the
+    /// mic would be safe (onboarded, permissions granted, no other
+    /// voice flow currently mid-session).
+    ///
+    /// Safe to call any time — if conditions haven't changed, this
+    /// is a no-op thanks to `start()`'s internal `isRunning` guard.
+    func refreshWakeWordListenerLifecycle() {
+        let shouldBeListening = isWakeWordListeningEnabled
+            && hasCompletedOnboarding
+            && allPermissionsGranted
+            && !buddyDictationManager.isDictationInProgress
+            && !showOnboardingVideo
+            // Never listen while Koko's own TTS is coming out the
+            // speakers — otherwise the mic picks up Koko saying
+            // "koko" in its reply and re-triggers the wake word.
+            && !elevenLabsTTSClient.isPlaying
+            // Never listen mid-response — the pipeline owns the mic
+            // and the wake listener fighting for the input node
+            // would either be useless (no detection while the user
+            // is waiting on a response) or actively harmful
+            // (capturing TTS audio).
+            && currentResponseTask == nil
+
+        if shouldBeListening {
+            kokoWakeWordListener.start()
+        } else {
+            kokoWakeWordListener.stop()
+        }
+    }
+
+    private func handleWakeWordDetection() {
+        kokoSoundEffects.play(.wake)
+
+        // Immediately free the mic so the main dictation pipeline can
+        // take it over without fighting CoreAudio for the input node.
+        kokoWakeWordListener.stop()
+
+        // Return from nest immediately so the bird starts swooping
+        // back the moment the user speaks, not seconds later when
+        // the transcript is submitted.
+        kokoNest.resetIdleTimer()
+
+        // Mark this session as wake-word-originated so the
+        // providerReportedTurnEnd subscriber knows it's allowed to
+        // auto-close on the native end-of-turn signal. The start
+        // timestamp feeds the grace-period guard that ignores
+        // spurious end-of-turn signals fired during the half-beat
+        // pause between "Hey Koko" and the user's actual command.
+        isCurrentDictationSessionFromWakeWord = true
+        currentWakeWordSessionStartedAt = Date()
+
+        // Reject the detection if another voice flow is already in
+        // motion, the onboarding video is up, or permissions dropped
+        // in the time between enabling the listener and this callback.
+        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard !showOnboardingVideo else { return }
+        guard hasCompletedOnboarding, allPermissionsGranted else { return }
+
+        // Same pre-flight as Ctrl+Option press — cancel pending hides,
+        // bring the overlay back if it was in transient-hidden mode,
+        // dismiss the menu bar panel, and clear any in-flight response.
+        transientHideTask?.cancel()
+        transientHideTask = nil
+        if !isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        currentResponseTask?.cancel()
+        elevenLabsTTSClient.stopPlayback()
+        textResponseOverlayManager.hide()
+        clearDetectedElementLocation()
+
+        ClickyAnalytics.trackPushToTalkStarted()
+
+        pendingKeyboardShortcutStartTask?.cancel()
+        pendingKeyboardShortcutStartTask = Task {
+            await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
+                currentDraftText: "",
+                updateDraftText: { _ in
+                    // Partial transcripts are hidden (waveform-only UI).
+                },
+                submitDraftText: { [weak self] finalTranscript in
+                    self?.lastTranscript = finalTranscript
+                    print("🗣️ Koko received wake-word transcript: \(finalTranscript)")
+                    ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
+                    self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                }
+            )
+            await self.startWakeWordSilenceAutoStop()
+        }
+    }
+
+    /// Polls `currentAudioPowerLevel` after a wake-word-triggered
+    /// dictation session starts and hard-stops the session once the
+    /// user has been silent long enough. Wake-word flows have no
+    /// press/release gesture to end the turn, so this is what closes
+    /// it out.
+    ///
+    /// Silence detection uses a *relative* peak-tracking heuristic
+    /// rather than a fixed threshold: ambient noise in a typical room
+    /// can easily sit at 0.03–0.06 on this scale, so a fixed floor
+    /// either cuts people off mid-sentence or never fires at all.
+    /// Instead we remember the loudest level observed during the
+    /// session and declare silence when the current level drops to
+    /// roughly 15% of that peak. The peak decays slowly so a single
+    /// brief loud syllable doesn't lock the threshold at an unreachable
+    /// value.
+    ///
+    /// Backstops:
+    /// - A 1.0s warm-up at the start so a brisk "Hey Koko" doesn't
+    ///   immediately count as silence before the command lands.
+    /// - A hard 15s maximum turn length so the session can't get
+    ///   stuck open even if silence detection totally fails.
+    /// - Starts the silence monitor only *after* confirming the
+    ///   dictation manager has actually flipped into "recording"
+    ///   state, so a race with `startPushToTalkFromKeyboardShortcut`
+    ///   can't terminate the monitor before it begins.
+    private func startWakeWordSilenceAutoStop() async {
+        wakeWordSilenceAutoStopTask?.cancel()
+        wakeWordSilenceAutoStopTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            let warmUpDurationSeconds: Double = 1.0
+            let requiredConsecutiveSilenceSeconds: Double = 1.2
+            let silencePollIntervalMilliseconds: UInt64 = 80
+            // Typical laptop mic ambient noise lands around 0.05–0.10
+            // on this boosted RMS scale. A floor below that range
+            // never fires in real rooms, which is exactly what was
+            // happening — 0.035 was always above ambient, so the
+            // detector saw "not silent" forever.
+            let absoluteSilenceFloor: CGFloat = 0.10
+            // Silence fires when current is below 30% of the observed
+            // peak (widened from 15% so louder speakers don't lock
+            // the bar at an unreachable level).
+            let relativeSilenceFractionOfPeak: CGFloat = 0.30
+            // Decay the peak faster (4.5% per 80ms ≈ 45% per second)
+            // so the relative threshold catches up within a second of
+            // the user going quiet.
+            let peakDecayFactorPerPoll: CGFloat = 0.955
+            let maximumTurnDurationSeconds: Double = 15.0
+
+            // Wait for the dictation manager to actually enter the
+            // recording state. There's a brief async window between
+            // `startPushToTalkFromKeyboardShortcut` returning and the
+            // first audio buffer landing, and without this guard the
+            // monitor can race past the recording-state check and
+            // terminate itself before it's done anything useful.
+            var dictationStartWaitAttempts = 0
+            while !Task.isCancelled
+                && !self.buddyDictationManager.isRecordingFromKeyboardShortcut
+                && dictationStartWaitAttempts < 40 {
+                try? await Task.sleep(nanoseconds: 50 * 1_000_000)
+                dictationStartWaitAttempts += 1
+            }
+            guard self.buddyDictationManager.isRecordingFromKeyboardShortcut else {
+                print("🪺 Koko wake word: dictation never started — bailing silence monitor")
+                return
+            }
+
+            // Warm-up so the "Hey Koko" + the lead-in to the real
+            // command isn't mistaken for silence.
+            try? await Task.sleep(for: .milliseconds(UInt64(warmUpDurationSeconds * 1000)))
+
+            let sessionStartedAt = Date()
+            var observedPeakPowerLevel: CGFloat = 0
+            var firstSilenceObservedAt: Date?
+
+            print("🪺 Koko wake word: silence monitor active")
+
+            while !Task.isCancelled {
+                guard self.buddyDictationManager.isRecordingFromKeyboardShortcut else {
+                    print("🪺 Koko wake word: dictation ended before silence detector fired")
+                    break
+                }
+
+                // Hard cap — if the silence detector totally misfires,
+                // the session still ends after 15 seconds so Koko
+                // never becomes a permanent hot mic.
+                if Date().timeIntervalSince(sessionStartedAt) >= maximumTurnDurationSeconds {
+                    print("🪺 Koko wake word: hit maximum turn length (\(maximumTurnDurationSeconds)s) — force-stopping")
+                    self.buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+                    break
+                }
+
+                let currentAudioPowerLevel = self.buddyDictationManager.currentAudioPowerLevel
+
+                // Track the loudest level the user has produced during
+                // this turn and let it decay gently each poll so a
+                // single loud peak doesn't permanently set the bar
+                // above what "silence" can reach.
+                if currentAudioPowerLevel > observedPeakPowerLevel {
+                    observedPeakPowerLevel = currentAudioPowerLevel
+                } else {
+                    observedPeakPowerLevel *= peakDecayFactorPerPoll
+                }
+
+                // "Silence" = both (a) well below the user's recent
+                // speaking peak, and (b) below an absolute floor so
+                // mere ambient hiss doesn't count as speech.
+                let relativeSilenceThreshold = observedPeakPowerLevel * relativeSilenceFractionOfPeak
+                let silenceThreshold = max(absoluteSilenceFloor, relativeSilenceThreshold)
+                let isCurrentlySilent = currentAudioPowerLevel < silenceThreshold
+
+                let now = Date()
+                if isCurrentlySilent {
+                    if firstSilenceObservedAt == nil {
+                        firstSilenceObservedAt = now
+                    } else if let silenceStartedAt = firstSilenceObservedAt,
+                              now.timeIntervalSince(silenceStartedAt) >= requiredConsecutiveSilenceSeconds {
+                        print(String(
+                            format: "🪺 Koko wake word: auto-stopping (silent %.1fs, peak %.3f, floor %.3f)",
+                            requiredConsecutiveSilenceSeconds,
+                            observedPeakPowerLevel,
+                            silenceThreshold
+                        ))
+                        self.buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+                        break
+                    }
+                } else {
+                    firstSilenceObservedAt = nil
+                }
+
+                try? await Task.sleep(nanoseconds: silencePollIntervalMilliseconds * 1_000_000)
+            }
+        }
+    }
+
+    private func handlePanelHotkeyPressed() {
+        // Don't fight with the push-to-talk flow — if the user is already
+        // speaking, the hotkey is probably a misfire from the ctrl+option
+        // chord rather than a deliberate "open the typed input" action.
+        guard !buddyDictationManager.isDictationInProgress else { return }
+        // Respect the same onboarding/permissions gating used elsewhere so
+        // the user can't type prompts before the app is actually usable.
+        guard hasCompletedOnboarding, allPermissionsGranted else { return }
+
+        // Dismiss the text response panel so the two don't overlap.
+        textResponseOverlayManager.hide()
+        typedInputOverlayManager.toggle()
+    }
+
+    /// Public entry point for the Spotlight-style typed command field in the
+    /// menu bar panel. Runs the same pre-flight as push-to-talk (cancel any
+    /// in-flight response, bring the overlay back if hidden, dismiss the
+    /// panel), then hands the typed text to the standard Claude + screenshot
+    /// + TTS + element-pointing pipeline.
+    func submitTypedCommand(_ typedCommandText: String) {
+        let trimmedTypedCommand = typedCommandText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTypedCommand.isEmpty else { return }
+        guard hasCompletedOnboarding, allPermissionsGranted else { return }
+
+        // Return from nest immediately on typed command.
+        kokoNest.resetIdleTimer()
+
+        // Cancel any pending transient hide so the overlay stays visible
+        // through the full response cycle.
+        transientHideTask?.cancel()
+        transientHideTask = nil
+
+        // If the cursor overlay is hidden (transient-cursor mode), bring it
+        // back for the duration of this interaction — matches the push-to-talk
+        // path in `handleShortcutTransition(.pressed)`.
+        if !isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        // Dismiss the menu bar panel so the response renders in the full-screen
+        // overlay without being covered.
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+
+        // Cancel any in-progress response and TTS from a previous utterance.
+        currentResponseTask?.cancel()
+        elevenLabsTTSClient.stopPlayback()
+        textResponseOverlayManager.hide()
+        clearDetectedElementLocation()
+
+        lastTranscript = trimmedTypedCommand
+        ClickyAnalytics.trackUserMessageSent(transcript: trimmedTypedCommand)
+        sendTranscriptToClaudeWithScreenshot(transcript: trimmedTypedCommand)
+    }
+
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // If continuous listen is active, pressing again STOPS it.
+            if isContinuousListenActive {
+                isContinuousListenActive = false
+                wakeWordSilenceAutoStopTask?.cancel()
+                wakeWordSilenceAutoStopTask = nil
+                ClickyAnalytics.trackPushToTalkReleased()
+                pendingKeyboardShortcutStartTask?.cancel()
+                pendingKeyboardShortcutStartTask = nil
+                buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+                lastShortcutPressedAt = nil
+                return
+            }
+
             guard !buddyDictationManager.isDictationInProgress else { return }
-            // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
 
-            // Cancel any pending transient hide so the overlay stays visible
+            // Detect double-press: if two presses within the threshold,
+            // enter continuous-listen mode (toggle on/off). Otherwise
+            // it's a normal hold-to-talk.
+            let now = Date()
+            let isDoublePress: Bool
+            if let lastPressAt = lastShortcutPressedAt,
+               now.timeIntervalSince(lastPressAt) < Self.doublePressThresholdSeconds {
+                isDoublePress = true
+                lastShortcutPressedAt = nil
+            } else {
+                isDoublePress = false
+                lastShortcutPressedAt = now
+            }
+
+            // Common pre-flight for both modes.
+            kokoWakeWordListener.stop()
+            wakeWordSilenceAutoStopTask?.cancel()
+            wakeWordSilenceAutoStopTask = nil
+            isCurrentDictationSessionFromWakeWord = false
+            currentWakeWordSessionStartedAt = nil
+
+            // Return from nest immediately so the bird starts
+            // swooping back the moment Ctrl+Option is pressed.
+            kokoNest.resetIdleTimer()
+
             transientHideTask?.cancel()
             transientHideTask = nil
 
-            // If the cursor is hidden, bring it back transiently for this interaction
             if !isClickyCursorEnabled && !isOverlayVisible {
                 overlayWindowManager.hasShownOverlayBefore = true
                 overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                 isOverlayVisible = true
             }
 
-            // Dismiss the menu bar panel so it doesn't cover the screen
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
-            // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
+            currentResponseTask = nil
             elevenLabsTTSClient.stopPlayback()
+            textResponseOverlayManager.hide()
             clearDetectedElementLocation()
 
-            // Dismiss the onboarding prompt if it's showing
             if showOnboardingPrompt {
                 withAnimation(.easeOut(duration: 0.3)) {
                     onboardingPromptOpacity = 0.0
@@ -506,34 +1513,61 @@ final class CompanionManager: ObservableObject {
                     self.onboardingPromptText = ""
                 }
             }
-    
 
+            kokoSoundEffects.play(.listen)
             ClickyAnalytics.trackPushToTalkStarted()
+
+            if isDoublePress {
+                isContinuousListenActive = true
+                print("🎙️ Continuous listen: ON (double-press detected)")
+            }
 
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = Task {
                 await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
                     currentDraftText: "",
-                    updateDraftText: { _ in
-                        // Partial transcripts are hidden (waveform-only UI)
-                    },
+                    updateDraftText: { _ in },
                     submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
-                        print("🗣️ Companion received transcript: \(finalTranscript)")
-                        ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        guard let self else { return }
+                        let trimmedTranscript = finalTranscript
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                        // Don't send empty transcripts to Claude — this
+                        // happens when the user releases the shortcut
+                        // before saying anything. Just go back to idle.
+                        guard !trimmedTranscript.isEmpty else {
+                            print("🎙️ Empty transcript — skipping response")
+                            return
+                        }
+
+                        self.lastTranscript = trimmedTranscript
+                        print("🗣️ Companion received transcript: \(trimmedTranscript)")
+                        ClickyAnalytics.trackUserMessageSent(transcript: trimmedTranscript)
+                        self.sendTranscriptToClaudeWithScreenshot(transcript: trimmedTranscript)
                     }
                 )
+
+                // In continuous-listen mode, start the silence auto-stop
+                // so the session ends naturally when the user stops
+                // speaking (same system as wake-word flows).
+                if self.isContinuousListenActive {
+                    await self.startWakeWordSilenceAutoStop()
+                }
             }
+
         case .released:
-            // Cancel the pending start task in case the user released the shortcut
-            // before the async startPushToTalk had a chance to begin recording.
-            // Without this, a quick press-and-release drops the release event and
-            // leaves the waveform overlay stuck on screen indefinitely.
+            // In continuous-listen mode, releasing the keys is a no-op —
+            // the session stays open until the user presses again or
+            // silence auto-stop fires.
+            if isContinuousListenActive {
+                return
+            }
+
             ClickyAnalytics.trackPushToTalkReleased()
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+
         case .none:
             break
         }
@@ -542,7 +1576,7 @@ final class CompanionManager: ObservableObject {
     // MARK: - Companion Prompt
 
     private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    you're koko, a friendly always-on companion (a little pixel-art koyal bird) that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
     rules:
     - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
@@ -576,6 +1610,17 @@ final class CompanionManager: ObservableObject {
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
     """
 
+    /// Builds the full system prompt by appending memory context (if
+    /// enabled) to the base voice-response prompt.
+    private func buildSystemPromptWithMemory() -> String {
+        var systemPrompt = Self.companionVoiceResponseSystemPrompt
+        let memoryContent = kokoMemoryManager.loadMemoryForPrompt()
+        if !memoryContent.isEmpty {
+            systemPrompt += "\n\nyour memory of past interactions with this user:\n\(memoryContent)"
+        }
+        return systemPrompt
+    }
+
     // MARK: - AI Response Pipeline
 
     /// Captures a screenshot, sends it along with the transcript to Claude,
@@ -584,12 +1629,31 @@ final class CompanionManager: ObservableObject {
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+        resetInteractionTimers()
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
 
-        currentResponseTask = Task {
+        // Snapshot the mode at the start of the turn so a mid-response
+        // toggle doesn't change how this particular response ends.
+        let isThisResponseTextOnly = isTextOnlyMode
+
+        // In text-only mode, open the scrollable text panel immediately
+        // in a "waiting for first chunk" state so the user gets instant
+        // acknowledgement that Koko is working on it.
+        if isThisResponseTextOnly {
+            // Dismiss the typed input so the two panels don't overlap.
+            typedInputOverlayManager.hide()
+            textResponseOverlayManager.beginStreamingResponse()
+        } else {
+            textResponseOverlayManager.hide()
+        }
+
+        currentResponseTask = Task { [weak self] in
+            guard let self else { return }
+
             // Stay in processing (spinner) state — no streaming text displayed
-            voiceState = .processing
+            self.voiceState = .processing
+            self.kokoSoundEffects.play(.think)
 
             do {
                 // Capture all connected screens so the AI has full context
@@ -606,17 +1670,28 @@ final class CompanionManager: ObservableObject {
                 }
 
                 // Pass conversation history so Claude remembers prior exchanges
-                let historyForAPI = conversationHistory.map { entry in
+                let historyForAPI = self.conversationHistory.map { entry in
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let (fullResponseText, _) = try await self.claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: self.buildSystemPromptWithMemory(),
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    onTextChunk: { [weak self] accumulatedText in
+                        guard let self, isThisResponseTextOnly else { return }
+                        let cleanedText = Self.stripPointingTagFromStreamingText(accumulatedText)
+                        Task { @MainActor in
+                            // Switch to .responding the moment the first
+                            // chunk arrives so the talking animation plays
+                            // while text streams in — Koko "speaks" the
+                            // text even though there's no audio.
+                            if self.voiceState != .responding {
+                                self.voiceState = .responding
+                            }
+                            self.textResponseOverlayManager.updateStreamingResponse(text: cleanedText)
+                        }
                     }
                 )
 
@@ -675,6 +1750,7 @@ final class CompanionManager: ObservableObject {
 
                     detectedElementScreenLocation = globalLocation
                     detectedElementDisplayFrame = displayFrame
+                    self.kokoSoundEffects.play(.point)
                     ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
                     print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
                 } else {
@@ -695,34 +1771,161 @@ final class CompanionManager: ObservableObject {
 
                 print("🧠 Conversation history: \(conversationHistory.count) exchanges")
 
+                // Memory is saved once per session (on quit), not
+                // per-exchange. conversationHistory holds everything
+                // Claude needs to summarize the session.
+
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if isThisResponseTextOnly {
+                    // Text-only mode: the onTextChunk callback already
+                    // set voiceState = .responding and streamed text
+                    // into the panel. Push the final cleaned version
+                    // to guarantee completeness, then mark done.
+                    self.textResponseOverlayManager.updateStreamingResponse(text: spokenText)
+                    self.textResponseOverlayManager.finishStreamingResponse()
+                    // voiceState is already .responding from onTextChunk
+                } else if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // Voice mode: play the response via ElevenLabs TTS.
+                    // Keep the spinner (processing state) until the
+                    // audio actually starts playing, then switch to
+                    // responding and HOLD that state until playback
+                    // finishes — otherwise the talking animation would
+                    // flash for one frame and then snap to idle.
                     do {
-                        try await elevenLabsTTSClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
+                        try await self.elevenLabsTTSClient.speakText(spokenText)
+                        self.voiceState = .responding
+
+                        // Wait for TTS playback to actually finish so
+                        // the talking animation plays for the full
+                        // duration of Koko's reply.
+                        while self.elevenLabsTTSClient.isPlaying {
+                            guard !Task.isCancelled else { break }
+                            try await Task.sleep(for: .milliseconds(100))
+                        }
+                    } catch is CancellationError {
+                        // User interrupted — fall through to idle
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        self.speakCreditsErrorFallback()
                     }
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
+                if isThisResponseTextOnly {
+                    self.textResponseOverlayManager.hide()
+                }
             } catch {
+                self.kokoSoundEffects.play(.error)
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                if isThisResponseTextOnly {
+                    self.textResponseOverlayManager.updateStreamingResponse(
+                        text: "couldn't reach claude. try again in a moment."
+                    )
+                    self.textResponseOverlayManager.finishStreamingResponse()
+                } else {
+                    self.speakCreditsErrorFallback()
+                }
             }
 
             if !Task.isCancelled {
-                voiceState = .idle
-                scheduleTransientHideIfNeeded()
+                self.kokoSoundEffects.play(.done)
+                self.voiceState = .idle
+                self.scheduleTransientHideIfNeeded()
             }
+
+            // Critical: nil out the task reference so
+            // refreshWakeWordListenerLifecycle sees
+            // currentResponseTask == nil and can restart the
+            // listener. Without this, the wake word listener
+            // stays dead after the first response.
+            self.currentResponseTask = nil
         }
+    }
+
+    /// Summarizes the entire session's conversation history into a
+    /// few short bullet points and appends them to memory.md. Called
+    /// once in `stop()` when the app is quitting — NOT per-exchange.
+    /// Uses a synchronous semaphore so the summary completes before
+    /// the process terminates.
+    private func summarizeSessionToMemory() {
+        guard kokoMemoryManager.isEnabled else { return }
+        guard !conversationHistory.isEmpty else { return }
+
+        // Build a condensed transcript for Claude to summarize.
+        let sessionTranscript = conversationHistory.map { exchange in
+            "User: \(exchange.userTranscript.prefix(100))\nKoko: \(exchange.assistantResponse.prefix(150))"
+        }.joined(separator: "\n---\n")
+
+        let summaryPrompt = """
+        Here is a session of \(conversationHistory.count) exchange(s) between a user and their bird companion Koko:
+
+        \(sessionTranscript)
+
+        Summarize what Koko learned about the user in 1-3 bullet points. Each bullet should be a short fact (under 15 words) worth remembering for next time. Focus on preferences, projects, or recurring topics — not transient questions. If nothing worth remembering, respond with just "skip".
+        """
+
+        // Use a semaphore to block until the summary completes,
+        // because applicationWillTerminate doesn't wait for async
+        // work to finish.
+        let semaphore = DispatchSemaphore(value: 0)
+
+        Task.detached { [weak self] in
+            guard let self else { semaphore.signal(); return }
+            do {
+                let claudeAPI = await self.claudeAPI
+                let (summaryText, _) = try await claudeAPI.analyzeImageStreaming(
+                    images: [],
+                    systemPrompt: "You are a memory summarizer. Output ONLY the bullet points, nothing else. Each line starts with '- '. No quotes, no preamble, no headers.",
+                    conversationHistory: [],
+                    userPrompt: summaryPrompt,
+                    onTextChunk: { _ in }
+                )
+
+                let cleanedSummary = summaryText
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if cleanedSummary.lowercased() != "skip" && !cleanedSummary.isEmpty {
+                    await MainActor.run {
+                        // Append each bullet as a separate line.
+                        let lines = cleanedSummary.components(separatedBy: "\n")
+                            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            .filter { !$0.isEmpty }
+                        for line in lines {
+                            self.kokoMemoryManager.appendSummary(line.hasPrefix("- ") ? String(line.dropFirst(2)) : line)
+                        }
+                    }
+                    print("🧠 Session memory saved (\(cleanedSummary.components(separatedBy: "\n").count) items)")
+                }
+            } catch {
+                print("⚠️ Session memory summary failed: \(error.localizedDescription)")
+            }
+            semaphore.signal()
+        }
+
+        // Wait up to 10 seconds for the summary to complete before
+        // the process terminates. If Claude is slow or unreachable,
+        // we give up and the session's conversations are lost from
+        // memory (but still in the in-session history if the app
+        // is re-opened quickly).
+        _ = semaphore.wait(timeout: .now() + 10)
+    }
+
+    /// Removes a trailing `[POINT:...]` tag (and anything after it) from
+    /// streaming response text so the text-mode panel never flashes the
+    /// pointing metadata to the user mid-stream.
+    private static func stripPointingTagFromStreamingText(_ streamingText: String) -> String {
+        // Remove [POINT:...] tags wherever they appear — beginning,
+        // middle, or end of the text. Claude doesn't always put them
+        // at the end.
+        let stripped = streamingText.replacingOccurrences(
+            of: "\\[POINT:[^\\]]*\\]",
+            with: "",
+            options: .regularExpression
+        )
+        return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// If the cursor is in transient mode (user toggled "Show Clicky" off),
@@ -1014,7 +2217,7 @@ final class CompanionManager: ObservableObject {
 
                 // Set custom bubble text so the pointing animation uses Claude's
                 // comment instead of a random phrase
-                detectedElementBubbleText = parseResult.spokenText
+                detectedElementBubbleText = parseResult.elementLabel
                 detectedElementScreenLocation = globalLocation
                 detectedElementDisplayFrame = displayFrame
                 print("🎯 Onboarding demo: pointing at \"\(parseResult.elementLabel ?? "element")\" — \"\(parseResult.spokenText)\"")

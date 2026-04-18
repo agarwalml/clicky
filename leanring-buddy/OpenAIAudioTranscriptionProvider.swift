@@ -59,6 +59,10 @@ final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
 private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscriptionSession {
     let finalTranscriptFallbackDelaySeconds: TimeInterval = 8.0
 
+    /// OpenAI is upload-based (buffers the whole clip and transcribes
+    /// on stop) so there's no streaming turn signal to expose here.
+    var onTurnEndedByProvider: (() -> Void)?
+
     private struct TranscriptionResponse: Decodable {
         let text: String
     }

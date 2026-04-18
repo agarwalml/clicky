@@ -52,24 +52,6 @@ class OverlayWindow: NSWindow {
     }
 }
 
-// Cursor-like triangle shape (equilateral)
-struct Triangle: Shape {
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        let size = min(rect.width, rect.height)
-        let height = size * sqrt(3.0) / 2.0
-
-        // Top vertex
-        path.move(to: CGPoint(x: rect.midX, y: rect.midY - height / 1.5))
-        // Bottom left vertex
-        path.addLine(to: CGPoint(x: rect.midX - size / 2, y: rect.midY + height / 3))
-        // Bottom right vertex
-        path.addLine(to: CGPoint(x: rect.midX + size / 2, y: rect.midY + height / 3))
-        path.closeSubpath()
-        return path
-    }
-}
-
 // PreferenceKey for tracking bubble size
 struct SizePreferenceKey: PreferenceKey {
     static var defaultValue: CGSize = .zero
@@ -120,7 +102,10 @@ struct BlueCursorView: View {
         let mouseLocation = NSEvent.mouseLocation
         let localX = mouseLocation.x - screenFrame.origin.x
         let localY = screenFrame.height - (mouseLocation.y - screenFrame.origin.y)
-        _cursorPosition = State(initialValue: CGPoint(x: localX + 35, y: localY + 25))
+        _cursorPosition = State(initialValue: CGPoint(
+            x: localX + BlueCursorView.buddyCursorOffsetX,
+            y: localY + BlueCursorView.buddyCursorOffsetY
+        ))
         _isCursorOnThisScreen = State(initialValue: screenFrame.contains(mouseLocation))
     }
     @State private var timer: Timer?
@@ -165,12 +150,80 @@ struct BlueCursorView: View {
     /// Only during the return flight can cursor movement cancel the animation.
     @State private var isReturningToCursor: Bool = false
 
+    // MARK: - Koyal Sprite Animation State
+
+    /// Rendered sprite frame size (points). Sized so the pixel-art frames
+    /// have real presence on screen — small enough to not be obnoxious,
+    /// large enough to read as a character rather than a cursor accent.
+    private let koyalSpriteRenderedSize: CGFloat = 96
+
+    static let buddyCursorOffsetX: CGFloat = 55
+    static let buddyCursorOffsetY: CGFloat = 38
+
+    // MARK: - Sprite Animation State
+
+    /// The animation set currently driving the sprite. Changes when
+    /// the bird's behavioral state changes (idle → listening, etc.).
+    @State private var currentAnimationSet: KokoAnimationSet = .flight
+
+    /// Current frame index within `currentAnimationSet`.
+    @State private var currentSpriteFrameIndex: Int = 0
+
+    /// The asset name rendered by the Image view. Derived from
+    /// `currentAnimationSet.frameNames[currentSpriteFrameIndex]`.
+    @State private var currentSpriteFrameName: String = KokoAnimationSet.flight.frameNames[0]
+
+    /// Timer that advances the sprite frame. Uses variable per-frame
+    /// delays (Pokemon "animation on twos" style) instead of a fixed
+    /// interval, so key poses hold longer and transitions are quick.
+    @State private var spriteFrameTimer: Timer?
+
+    /// How many seconds the cursor has been stationary. When this
+    /// exceeds `cursorIdleThresholdSeconds`, the animation switches
+    /// from flight to perched.
+    @State private var cursorIdleSeconds: TimeInterval = 0
+    private let cursorIdleThresholdSeconds: TimeInterval = 1.5
+
+    /// Last cursor position used to detect whether the cursor has
+    /// moved (for idle detection). Different from
+    /// `previousCursorXForFacingCheck` which only tracks X for
+    /// horizontal flip — this tracks both axes with a larger
+    /// movement threshold.
+    @State private var lastCursorPositionForIdleCheck: CGPoint = .zero
+
+    /// Whether the koyal sprite should be mirrored horizontally so it appears
+    /// to face left. The source sprite faces right, so `false` = facing right.
+    /// Flipped based on direction of travel — either cursor movement while
+    /// following, or the vector to the target when navigating.
+    @State private var isKoyalSpriteFacingLeft: Bool = false
+
+    /// Last cursor X position observed during following, used to compute
+    /// horizontal direction without flipping on every sub-pixel jitter.
+    @State private var previousCursorXForFacingCheck: CGFloat = 0
+
+    /// True while the bird is performing its first-launch entrance flight
+    /// from the edge of the screen toward the cursor. Cursor tracking is
+    /// suspended during this window so the intro animation plays cleanly.
+    @State private var isPerformingIntroFlight: Bool = false
+
+    /// True while the bird is swooping back from the nest corner to
+    /// the cursor via a one-shot bezier arc. Prevents the nest-return
+    /// detection block from re-triggering on every tick.
+    @State private var isNestReturnFlightInProgress: Bool = false
+
+    /// Timer driving the frame-by-frame position interpolation of the
+    /// intro flight. Using a timer (rather than `withAnimation`) avoids
+    /// SwiftUI coalescing the edge→rest state changes into a single
+    /// render pass, which was causing the bird to skip the flight and
+    /// just appear at the cursor.
+    @State private var introFlightTimer: Timer?
+
     // MARK: - Onboarding Video Layout
 
     private let onboardingVideoPlayerWidth: CGFloat = 330
     private let onboardingVideoPlayerHeight: CGFloat = 186
 
-    private let fullWelcomeMessage = "hey! i'm clicky"
+    private let fullWelcomeMessage = "hey! i'm koko"
 
     private let navigationPointerPhrases = [
         "right here!",
@@ -189,15 +242,16 @@ struct BlueCursorView: View {
             // Welcome speech bubble (first launch only)
             if isCursorOnThisScreen && showWelcome && !welcomeText.isEmpty {
                 Text(welcomeText)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
-                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
-                    )
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(PixelDialogueBoxBackground(
+                        fillColor: DS.Colors.overlayCursorRed.opacity(0.9),
+                        borderColor: .white.opacity(0.6),
+                        outerBorderColor: DS.Colors.overlayCursorRed.opacity(0.3),
+                        pixelSize: 2
+                    ))
                     .fixedSize()
                     .overlay(
                         GeometryReader { geo in
@@ -206,7 +260,7 @@ struct BlueCursorView: View {
                         }
                     )
                     .opacity(bubbleOpacity)
-                    .position(x: cursorPosition.x + 10 + (bubbleSize.width / 2), y: cursorPosition.y + 18)
+                    .position(x: cursorPosition.x + koyalSpriteRenderedSize / 2 + 6 + (bubbleSize.width / 2), y: cursorPosition.y)
                     .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                     .animation(.easeOut(duration: 0.5), value: bubbleOpacity)
                     .onPreferenceChange(SizePreferenceKey.self) { newSize in
@@ -233,15 +287,16 @@ struct BlueCursorView: View {
             // Onboarding prompt — "press control + option and say hi" streamed after video ends
             if isCursorOnThisScreen && companionManager.showOnboardingPrompt && !companionManager.onboardingPromptText.isEmpty {
                 Text(companionManager.onboardingPromptText)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
-                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
-                    )
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(PixelDialogueBoxBackground(
+                        fillColor: DS.Colors.overlayCursorRed.opacity(0.9),
+                        borderColor: .white.opacity(0.6),
+                        outerBorderColor: DS.Colors.overlayCursorRed.opacity(0.3),
+                        pixelSize: 2
+                    ))
                     .fixedSize()
                     .overlay(
                         GeometryReader { geo in
@@ -250,7 +305,7 @@ struct BlueCursorView: View {
                         }
                     )
                     .opacity(companionManager.onboardingPromptOpacity)
-                    .position(x: cursorPosition.x + 10 + (bubbleSize.width / 2), y: cursorPosition.y + 18)
+                    .position(x: cursorPosition.x + koyalSpriteRenderedSize / 2 + 6 + (bubbleSize.width / 2), y: cursorPosition.y)
                     .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                     .animation(.easeOut(duration: 0.4), value: companionManager.onboardingPromptOpacity)
                     .onPreferenceChange(SizePreferenceKey.self) { newSize in
@@ -261,21 +316,44 @@ struct BlueCursorView: View {
             // Navigation pointer bubble — shown when buddy arrives at a detected element.
             // Pops in with a scale-bounce (0.5x → 1.0x spring) and a bright initial
             // glow that settles, creating a "materializing" effect.
+            // Text-mode toggle feedback pill — fades in for ~1.6s when
+            // the user hits Ctrl+Shift+T so the hotkey has visible
+            // confirmation. Sits just below the koyal sprite in the
+            // same slot the waveform uses during listening.
+            if companionManager.isShowingTextModeToggleFeedback
+                && !companionManager.textModeToggleFeedbackText.isEmpty {
+                Text(companionManager.textModeToggleFeedbackText)
+                    .font(.pixel(size: 16))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(PixelDialogueBoxBackground(
+                        fillColor: DS.Colors.overlayCursorRed.opacity(0.9),
+                        borderColor: .white.opacity(0.6),
+                        outerBorderColor: DS.Colors.overlayCursorRed.opacity(0.3),
+                        pixelSize: 2
+                    ))
+                    .fixedSize()
+                    .position(
+                        x: cursorPosition.x + koyalSpriteRenderedSize / 2 + 6,
+                        y: cursorPosition.y
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                    .animation(.easeOut(duration: 0.2), value: companionManager.isShowingTextModeToggleFeedback)
+            }
+
             if buddyNavigationMode == .pointingAtTarget && !navigationBubbleText.isEmpty {
                 Text(navigationBubbleText)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
-                            .shadow(
-                                color: DS.Colors.overlayCursorBlue.opacity(0.5 + (1.0 - navigationBubbleScale) * 1.0),
-                                radius: 6 + (1.0 - navigationBubbleScale) * 16,
-                                x: 0, y: 0
-                            )
-                    )
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(PixelDialogueBoxBackground(
+                        fillColor: DS.Colors.overlayCursorRed.opacity(0.9),
+                        borderColor: .white.opacity(0.6),
+                        outerBorderColor: DS.Colors.overlayCursorRed.opacity(0.3),
+                        pixelSize: 2
+                    ))
                     .fixedSize()
                     .overlay(
                         GeometryReader { geo in
@@ -285,7 +363,14 @@ struct BlueCursorView: View {
                     )
                     .scaleEffect(navigationBubbleScale)
                     .opacity(navigationBubbleOpacity)
-                    .position(x: cursorPosition.x + 10 + (navigationBubbleSize.width / 2), y: cursorPosition.y + 18)
+                    // Park the bubble just past the right edge of the koyal
+                    // sprite (40pt wide, centered on cursor) with a small
+                    // gap so it sits *next to* the bird instead of overlapping
+                    // its right half.
+                    .position(
+                        x: cursorPosition.x + (koyalSpriteRenderedSize / 2) + 8 + (navigationBubbleSize.width / 2),
+                        y: cursorPosition.y
+                    )
                     .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                     .animation(.spring(response: 0.4, dampingFraction: 0.6), value: navigationBubbleScale)
                     .animation(.easeOut(duration: 0.5), value: navigationBubbleOpacity)
@@ -294,45 +379,69 @@ struct BlueCursorView: View {
                     }
             }
 
-            // Blue triangle cursor — shown when idle or while TTS is playing (responding).
-            // All three states (triangle, waveform, spinner) stay in the view tree
+            // Koyal bird sprite cursor — shown when idle or while TTS is playing (responding).
+            // All three states (sprite, waveform, spinner) stay in the view tree
             // permanently and cross-fade via opacity so SwiftUI doesn't remove/re-insert
             // them (which caused a visible cursor "pop").
             //
             // During cursor following: fast spring animation for snappy tracking.
             // During navigation: NO implicit animation — the frame-by-frame bezier
             // timer controls position directly at 60fps for a smooth arc flight.
-            Triangle()
-                .fill(DS.Colors.overlayCursorBlue)
-                .frame(width: 16, height: 16)
-                .rotationEffect(.degrees(triangleRotationDegrees))
-                .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
+            //
+            // The sprite is horizontally mirrored (not rotated) based on direction
+            // of travel, because rotating a bird sprite to match a bezier tangent
+            // would make it fly upside-down through the apex of the arc.
+            Image(currentSpriteFrameName)
+                .resizable()
+                .interpolation(.none)
+                .scaledToFit()
+                .frame(width: koyalSpriteRenderedSize, height: koyalSpriteRenderedSize)
+                // New sprites face LEFT natively (old ones faced right),
+                // so the mirror logic is inverted: facing-left = show
+                // source as-is, facing-right = flip horizontally.
+                .scaleEffect(x: isKoyalSpriteFacingLeft ? 1 : -1, y: 1)
                 .scaleEffect(buddyFlightScale)
-                .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
+                .shadow(color: .black.opacity(0.45), radius: 6, x: 0, y: 2)
+                .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding || companionManager.voiceState == .listening || companionManager.voiceState == .processing) ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(
-                    buddyNavigationMode == .followingCursor
-                        ? .spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0)
-                        : nil,
+                    isPerformingIntroFlight
+                        // During the intro flight, let the explicit
+                        // withAnimation(.easeOut) in .onAppear own the
+                        // cursorPosition interpolation instead of fighting
+                        // the usual follow-cursor spring.
+                        ? nil
+                        : (buddyNavigationMode == .followingCursor
+                            ? .spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0)
+                            : nil),
                     value: cursorPosition
                 )
                 .animation(.easeIn(duration: 0.25), value: companionManager.voiceState)
-                .animation(
-                    buddyNavigationMode == .navigatingToTarget ? nil : .easeInOut(duration: 0.3),
-                    value: triangleRotationDegrees
-                )
+                .animation(.easeInOut(duration: 0.15), value: isKoyalSpriteFacingLeft)
 
-            // Blue waveform — replaces the triangle while listening
+            // Blue waveform — sits *below* the koyal sprite while listening so
+            // the bird stays visible on top and the waveform clearly belongs
+            // to "what clicky is hearing right now" without covering the
+            // character itself.
             BlueCursorWaveformView(audioPowerLevel: companionManager.currentAudioPowerLevel)
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening ? cursorOpacity : 0)
-                .position(cursorPosition)
+                .position(
+                    x: cursorPosition.x,
+                    y: cursorPosition.y + koyalSpriteRenderedSize / 2 + 10
+                )
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
-            // Blue spinner — shown while the AI is processing (transcription + Claude + waiting for TTS)
+            // Red spinner — sits at the bottom-right corner of the koyal
+            // sprite during processing so the bird stays visible and the
+            // loading indicator reads as a small badge on the character
+            // rather than replacing it.
             BlueCursorSpinnerView()
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
-                .position(cursorPosition)
+                .position(
+                    x: cursorPosition.x + koyalSpriteRenderedSize / 2 - 2,
+                    y: cursorPosition.y + koyalSpriteRenderedSize / 2 - 2
+                )
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
@@ -340,32 +449,69 @@ struct BlueCursorView: View {
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
         .onAppear {
-            // Set initial cursor position immediately before starting animation
             let mouseLocation = NSEvent.mouseLocation
             isCursorOnThisScreen = screenFrame.contains(mouseLocation)
 
             let swiftUIPosition = convertScreenPointToSwiftUICoordinates(mouseLocation)
-            self.cursorPosition = CGPoint(x: swiftUIPosition.x + 35, y: swiftUIPosition.y + 25)
+            let buddyRestingPosition = CGPoint(
+                x: swiftUIPosition.x + Self.buddyCursorOffsetX,
+                y: swiftUIPosition.y + Self.buddyCursorOffsetY
+            )
 
-            startTrackingCursor()
+            startSpriteAnimation()
 
-            // Only show welcome message on first appearance (app start)
-            // and only if the cursor starts on this screen
+            // First-launch entrance: Koko spawns at whichever horizontal
+            // edge of this screen is furthest from the cursor, then flies
+            // in to its normal resting offset. Only runs on the very first
+            // appearance and only if the cursor is on this screen so the
+            // flight is actually visible to the user.
             if isFirstAppearance && isCursorOnThisScreen {
-                withAnimation(.easeIn(duration: 2.0)) {
-                    self.cursorOpacity = 1.0
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                    self.bubbleOpacity = 0.0
-                    startWelcomeAnimation()
-                }
-            } else {
+                // Always spawn Koko just past the *right* edge of the
+                // screen so the entrance reads the same way every time.
+                // `+ koyalSpriteRenderedSize` pushes the sprite bounding
+                // box fully offscreen so the flight starts from beyond
+                // the visible area.
+                let introFlightStartX: CGFloat = screenFrame.width + koyalSpriteRenderedSize
+                let introFlightStartPosition = CGPoint(
+                    x: introFlightStartX,
+                    y: buddyRestingPosition.y
+                )
+
+                // Suspend cursor tracking, snap the sprite to the edge,
+                // and make it visible immediately. The edge is offscreen
+                // so the instant visibility isn't visible, while fading
+                // in simultaneously with flying was washing the entrance
+                // out.
+                self.isPerformingIntroFlight = true
+                self.cursorPosition = introFlightStartPosition
+                self.previousCursorXForFacingCheck = introFlightStartX
+                // Face the direction of travel (leftward, since we're
+                // flying in from the right edge). Sprite source faces
+                // right; `true` mirrors it to face left.
+                self.isKoyalSpriteFacingLeft = true
                 self.cursorOpacity = 1.0
+
+                startIntroFlight(
+                    from: introFlightStartPosition,
+                    to: buddyRestingPosition
+                )
+            } else {
+                // Subsequent appearances (user toggled cursor off then on,
+                // re-added a screen, etc.) — no intro flight, just pop in
+                // at the resting position and start tracking.
+                self.cursorPosition = buddyRestingPosition
+                self.previousCursorXForFacingCheck = buddyRestingPosition.x
+                self.cursorOpacity = 1.0
+                startTrackingCursor()
             }
         }
         .onDisappear {
             timer?.invalidate()
             navigationAnimationTimer?.invalidate()
+            introFlightTimer?.invalidate()
+            introFlightTimer = nil
+            spriteFrameTimer?.invalidate()
+            spriteFrameTimer = nil
             companionManager.tearDownOnboardingVideo()
         }
         .onChange(of: companionManager.detectedElementScreenLocation) { newLocation in
@@ -413,10 +559,22 @@ struct BlueCursorView: View {
             let mouseLocation = NSEvent.mouseLocation
             self.isCursorOnThisScreen = self.screenFrame.contains(mouseLocation)
 
-            // During forward flight or pointing, the buddy is NOT interrupted by
-            // mouse movement — it completes its full animation and return flight.
-            // Only during the RETURN flight do we allow cursor movement to cancel
-            // (so the buddy snaps to following if the user moves while it's flying back).
+            // While the intro flight from the screen edge is playing, leave
+            // cursorPosition alone — the withAnimation in .onAppear owns it
+            // for the duration of the flight.
+            if self.isPerformingIntroFlight {
+                return
+            }
+
+            // Always update the animation set even when cursor position
+            // tracking is suspended (navigation flight, pointing, etc.)
+            self.updateAnimationSetForCurrentState()
+
+            // ── PRIORITY 1: Navigation/pointing always wins ──
+            // Active pointing/navigation takes absolute priority over
+            // nesting. Without this guard, the nest block below would
+            // override a pointing animation and pull the bird to the
+            // corner mid-flight.
             if self.buddyNavigationMode == .navigatingToTarget && self.isReturningToCursor {
                 let currentMouseInSwiftUI = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
                 let distanceFromNavigationStart = hypot(
@@ -428,17 +586,260 @@ struct BlueCursorView: View {
                 }
                 return
             }
-
-            // During forward navigation or pointing, just skip cursor tracking
             if self.buddyNavigationMode != .followingCursor {
                 return
             }
 
-            // Normal cursor following
+            // ── PRIORITY 2: Nesting ──
+            // Only runs when the bird is in .followingCursor mode (no
+            // active pointing/navigation). Eases toward the nest corner.
+            if self.companionManager.isNesting,
+               let nestScreenPos = self.companionManager.nestTargetScreenPosition {
+                let nestSwiftUI = self.convertScreenPointToSwiftUICoordinates(nestScreenPos)
+                let targetPosition = CGPoint(x: nestSwiftUI.x, y: nestSwiftUI.y)
+                let dx = targetPosition.x - self.cursorPosition.x
+                let dy = targetPosition.y - self.cursorPosition.y
+                let distance = hypot(dx, dy)
+                if distance > 2 {
+                    let easeFactor: CGFloat = 0.04
+                    self.cursorPosition = CGPoint(
+                        x: self.cursorPosition.x + dx * easeFactor,
+                        y: self.cursorPosition.y + dy * easeFactor
+                    )
+                    if dx < -4 { self.isKoyalSpriteFacingLeft = true }
+                    else if dx > 4 { self.isKoyalSpriteFacingLeft = false }
+                    self.switchToAnimationSet(.flight)
+                } else {
+                    self.cursorPosition = targetPosition
+                    let isOnRightSideOfScreen = targetPosition.x > self.screenFrame.width / 2
+                    self.isKoyalSpriteFacingLeft = isOnRightSideOfScreen
+                    self.switchToAnimationSet(.perched)
+                }
+                self.publishKokoScreenPosition()
+                return
+            }
+
+            // ── PRIORITY 3: Bezier swoop back from nest ──
+            // When nest state just flipped off and bird is far from
+            // cursor, trigger a one-shot bezier arc flight back. Uses
+            // the same arc system as element pointing for a smooth swoop.
+            if !self.companionManager.isNesting
+                && self.companionManager.nestTargetScreenPosition == nil
+                && !self.isNestReturnFlightInProgress {
+                let swiftUIPosition = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
+                let targetX = swiftUIPosition.x + Self.buddyCursorOffsetX
+                let targetY = swiftUIPosition.y + Self.buddyCursorOffsetY
+                let distanceToCursor = hypot(targetX - self.cursorPosition.x, targetY - self.cursorPosition.y)
+                if distanceToCursor > 80 {
+                    self.isNestReturnFlightInProgress = true
+                    let cursorTarget = CGPoint(x: targetX, y: targetY)
+                    self.cursorPositionWhenNavigationStarted = swiftUIPosition
+                    self.buddyNavigationMode = .navigatingToTarget
+                    self.isReturningToCursor = true
+                    self.switchToAnimationSet(.swoop)
+                    self.animateBezierFlightArc(to: cursorTarget) {
+                        self.finishNavigationAndResumeFollowing()
+                        self.isNestReturnFlightInProgress = false
+                    }
+                    return
+                }
+            }
+
+            // ── PRIORITY 4: Normal cursor following ──
             let swiftUIPosition = self.convertScreenPointToSwiftUICoordinates(mouseLocation)
-            let buddyX = swiftUIPosition.x + 35
-            let buddyY = swiftUIPosition.y + 25
-            self.cursorPosition = CGPoint(x: buddyX, y: buddyY)
+            let buddyX = swiftUIPosition.x + Self.buddyCursorOffsetX
+            let buddyY = swiftUIPosition.y + Self.buddyCursorOffsetY
+            let newCursorPosition = CGPoint(x: buddyX, y: buddyY)
+
+            // Flip the sprite horizontally to face the direction of cursor movement.
+            // Only flip when the horizontal delta exceeds a small threshold so the
+            // bird doesn't jitter back and forth on sub-pixel movement.
+            let horizontalDelta = newCursorPosition.x - self.previousCursorXForFacingCheck
+            let horizontalFlipThreshold: CGFloat = 4
+            if horizontalDelta < -horizontalFlipThreshold {
+                if !self.isKoyalSpriteFacingLeft {
+                    self.isKoyalSpriteFacingLeft = true
+                }
+                self.previousCursorXForFacingCheck = newCursorPosition.x
+            } else if horizontalDelta > horizontalFlipThreshold {
+                if self.isKoyalSpriteFacingLeft {
+                    self.isKoyalSpriteFacingLeft = false
+                }
+                self.previousCursorXForFacingCheck = newCursorPosition.x
+            }
+
+            self.cursorPosition = newCursorPosition
+            self.publishKokoScreenPosition()
+            self.updateCursorIdleTracking(newPosition: newCursorPosition)
+            self.updateAnimationSetForCurrentState()
+        }
+    }
+
+    /// Converts the bird's current SwiftUI position back to macOS screen
+    /// coordinates and pushes it to `CompanionManager.kokoCurrentScreenPosition`
+    /// so external panels (typed input, text response) can track where
+    /// Koko *actually* is — not just where the mouse cursor is.
+    private func publishKokoScreenPosition() {
+        let screenX = cursorPosition.x + screenFrame.origin.x
+        let screenY = (screenFrame.origin.y + screenFrame.height) - cursorPosition.y
+        companionManager.kokoCurrentScreenPosition = CGPoint(x: screenX, y: screenY)
+    }
+
+    // MARK: - Intro Flight
+
+    /// Frame-by-frame interpolation of the first-launch entrance flight.
+    /// Runs on a 60fps `Timer` (mirroring the navigation arc flight) so
+    /// SwiftUI can't coalesce the edge→rest state transitions into a
+    /// single render pass — the earlier `withAnimation` version was
+    /// silently skipping straight to the cursor position.
+    private func startIntroFlight(
+        from introFlightStartPosition: CGPoint,
+        to introFlightEndPosition: CGPoint
+    ) {
+        introFlightTimer?.invalidate()
+
+        let introFlightDurationSeconds: Double = 1.6
+        let frameInterval: TimeInterval = 1.0 / 60.0
+        let totalFrames = Int(introFlightDurationSeconds / frameInterval)
+        var currentFrame = 0
+
+        introFlightTimer = Timer.scheduledTimer(withTimeInterval: frameInterval, repeats: true) { _ in
+            currentFrame += 1
+
+            if currentFrame >= totalFrames {
+                self.introFlightTimer?.invalidate()
+                self.introFlightTimer = nil
+                self.cursorPosition = introFlightEndPosition
+                self.previousCursorXForFacingCheck = introFlightEndPosition.x
+                self.isPerformingIntroFlight = false
+                // Hand off to normal cursor tracking once the flight
+                // completes, and start the "hey! i'm koko" welcome
+                // bubble a beat later so it doesn't collide visually
+                // with the arrival.
+                self.startTrackingCursor()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    self.bubbleOpacity = 0.0
+                    self.startWelcomeAnimation()
+                }
+                return
+            }
+
+            // Smoothstep easeOut-ish progression: 1 - (1 - t)^3 gives a
+            // strong initial velocity that decays toward the cursor,
+            // which reads as a "landing" approach.
+            let linearProgress = Double(currentFrame) / Double(totalFrames)
+            let oneMinusProgress = 1.0 - linearProgress
+            let easedProgress = 1.0 - (oneMinusProgress * oneMinusProgress * oneMinusProgress)
+
+            let interpolatedX = introFlightStartPosition.x
+                + (introFlightEndPosition.x - introFlightStartPosition.x) * CGFloat(easedProgress)
+            let interpolatedY = introFlightStartPosition.y
+                + (introFlightEndPosition.y - introFlightStartPosition.y) * CGFloat(easedProgress)
+
+            self.cursorPosition = CGPoint(x: interpolatedX, y: interpolatedY)
+            self.publishKokoScreenPosition()
+        }
+    }
+
+    // MARK: - Sprite Animation System
+
+    /// Switches to a new animation set and starts cycling through its
+    /// frames with per-frame eased timing. If the requested set is
+    /// already active, this is a no-op (prevents restart flicker).
+    private func switchToAnimationSet(_ newAnimationSet: KokoAnimationSet) {
+        // Compare by first frame name as a cheap identity check — each
+        // animation set has unique asset names.
+        guard newAnimationSet.frameNames.first != currentAnimationSet.frameNames.first else { return }
+        currentAnimationSet = newAnimationSet
+        currentSpriteFrameIndex = 0
+        currentSpriteFrameName = newAnimationSet.frameNames[0]
+        scheduleNextSpriteFrame()
+    }
+
+    /// Starts the variable-delay frame cycling. Called once on appear
+    /// and again whenever the animation set changes.
+    private func startSpriteAnimation() {
+        scheduleNextSpriteFrame()
+    }
+
+    /// Schedules the next frame advance using the *current* frame's
+    /// hold duration. This is the Pokemon "animation on twos" pattern:
+    /// `setTimeout` with variable delays rather than `setInterval`
+    /// with a fixed framerate.
+    private func scheduleNextSpriteFrame() {
+        spriteFrameTimer?.invalidate()
+
+        let holdDuration = currentAnimationSet.frameHoldDurations[currentSpriteFrameIndex]
+
+        spriteFrameTimer = Timer.scheduledTimer(
+            withTimeInterval: holdDuration,
+            repeats: false
+        ) { _ in
+            let nextFrameIndex: Int
+            if self.currentAnimationSet.loops {
+                nextFrameIndex = (self.currentSpriteFrameIndex + 1) % self.currentAnimationSet.frameCount
+            } else {
+                nextFrameIndex = min(self.currentSpriteFrameIndex + 1, self.currentAnimationSet.frameCount - 1)
+            }
+            self.currentSpriteFrameIndex = nextFrameIndex
+            self.currentSpriteFrameName = self.currentAnimationSet.frameNames[nextFrameIndex]
+            self.scheduleNextSpriteFrame()
+        }
+    }
+
+    /// Evaluates the current behavioral state and switches to the
+    /// appropriate animation set. Called from the cursor-tracking
+    /// timer on every tick so transitions are immediate.
+    private func updateAnimationSetForCurrentState() {
+        let voiceState = companionManager.voiceState
+
+        // Navigation modes take priority over voice state.
+        if buddyNavigationMode == .navigatingToTarget {
+            switchToAnimationSet(.swoop)
+            return
+        }
+        if buddyNavigationMode == .pointingAtTarget {
+            switchToAnimationSet(.pointing)
+            return
+        }
+
+        switch voiceState {
+        case .listening:
+            switchToAnimationSet(.listening)
+        case .processing:
+            switchToAnimationSet(.thinking)
+        case .responding:
+            updateTalkingAnimation()
+        case .idle:
+            // If cursor has been still long enough, perch. Otherwise fly.
+            if cursorIdleSeconds >= cursorIdleThresholdSeconds {
+                switchToAnimationSet(.perched)
+            } else {
+                switchToAnimationSet(.flight)
+            }
+        }
+    }
+
+    /// Talking animation — just loops through the frames like every
+    /// other animation set. No fancy amplitude-driven logic.
+    private func updateTalkingAnimation() {
+        switchToAnimationSet(.talking)
+    }
+
+    /// Tracks cursor movement and updates `cursorIdleSeconds` so the
+    /// perched animation kicks in after the cursor is still.
+    private func updateCursorIdleTracking(newPosition: CGPoint) {
+        let movementThreshold: CGFloat = 6
+        let distance = hypot(
+            newPosition.x - lastCursorPositionForIdleCheck.x,
+            newPosition.y - lastCursorPositionForIdleCheck.y
+        )
+        if distance > movementThreshold {
+            cursorIdleSeconds = 0
+            lastCursorPositionForIdleCheck = newPosition
+        } else {
+            // Timer fires at ~60fps = 0.016s per tick
+            cursorIdleSeconds += 0.016
         }
     }
 
@@ -505,6 +906,14 @@ struct BlueCursorView: View {
         let deltaY = endPosition.y - startPosition.y
         let distance = hypot(deltaX, deltaY)
 
+        // Flip the sprite to face the target for the whole flight. Cursor
+        // tracking is paused during navigation, so we can't rely on the
+        // following-mode flip logic.
+        let flightGoesLeft = deltaX < 0
+        if flightGoesLeft != isKoyalSpriteFacingLeft {
+            isKoyalSpriteFacingLeft = flightGoesLeft
+        }
+
         // Flight duration scales with distance: short hops are quick, long
         // flights are more dramatic. Clamped to 0.6s–1.4s.
         let flightDurationSeconds = min(max(distance / 800.0, 0.6), 1.4)
@@ -549,6 +958,7 @@ struct BlueCursorView: View {
                         + t * t * endPosition.y
 
             self.cursorPosition = CGPoint(x: bezierX, y: bezierY)
+            self.publishKokoScreenPosition()
 
             // Rotation: face the direction of travel by computing the tangent
             // to the bezier curve. B'(t) = 2(1-t)(P1-P0) + 2t(P2-P1)
@@ -633,12 +1043,33 @@ struct BlueCursorView: View {
 
     /// Flies the buddy back to the current cursor position after pointing is done.
     private func startFlyingBackToCursor() {
+        // If the bird was nesting before this pointing flight, fly
+        // back to the nest corner instead of the cursor.
+        if let savedNest = companionManager.savedNestPosition {
+            let nestInSwiftUI = convertScreenPointToSwiftUICoordinates(savedNest)
+            cursorPositionWhenNavigationStarted = nestInSwiftUI
+            buddyNavigationMode = .navigatingToTarget
+            isReturningToCursor = true
+            animateBezierFlightArc(to: nestInSwiftUI) {
+                self.finishNavigationAndResumeFollowing()
+                // Bird has landed back at nest — clear savedNestPosition
+                // so future observations without nesting don't
+                // accidentally fly back here. isNesting and
+                // nestTargetScreenPosition stay set so the cursor
+                // tracking timer's nest block keeps the bird perched.
+                self.companionManager.savedNestPosition = nil
+            }
+            return
+        }
+
         let mouseLocation = NSEvent.mouseLocation
         let cursorInSwiftUI = convertScreenPointToSwiftUICoordinates(mouseLocation)
-        let cursorWithTrackingOffset = CGPoint(x: cursorInSwiftUI.x + 35, y: cursorInSwiftUI.y + 25)
+        let cursorWithTrackingOffset = CGPoint(
+            x: cursorInSwiftUI.x + Self.buddyCursorOffsetX,
+            y: cursorInSwiftUI.y + Self.buddyCursorOffsetY
+        )
 
         cursorPositionWhenNavigationStarted = cursorInSwiftUI
-
         buddyNavigationMode = .navigatingToTarget
         isReturningToCursor = true
 
@@ -669,6 +1100,9 @@ struct BlueCursorView: View {
         navigationBubbleText = ""
         navigationBubbleOpacity = 0.0
         navigationBubbleScale = 1.0
+        // Seed the facing-check baseline so the following-mode flip logic
+        // doesn't misfire on the first post-flight cursor update.
+        previousCursorXForFacingCheck = cursorPosition.x
         companionManager.clearDetectedElementLocation()
     }
 
@@ -689,8 +1123,9 @@ struct BlueCursorView: View {
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                     self.showWelcome = false
-                    // Start the onboarding video right after the welcome text disappears
-                    self.companionManager.setupOnboardingVideo()
+                    // Onboarding video is intentionally skipped — Koko's
+                    // intro flight + welcome bubble are the entire
+                    // first-launch experience now.
                 }
                 return
             }
@@ -717,7 +1152,7 @@ private struct BlueCursorWaveformView: View {
             HStack(alignment: .center, spacing: 2) {
                 ForEach(0..<barCount, id: \.self) { barIndex in
                     RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        .fill(DS.Colors.overlayCursorBlue)
+                        .fill(DS.Colors.overlayCursorRed)
                         .frame(
                             width: 2,
                             height: barHeight(
@@ -727,7 +1162,7 @@ private struct BlueCursorWaveformView: View {
                         )
                 }
             }
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: DS.Colors.overlayCursorRed.opacity(0.6), radius: 6, x: 0, y: 0)
             .animation(.linear(duration: 0.08), value: audioPowerLevel)
         }
     }
@@ -742,10 +1177,12 @@ private struct BlueCursorWaveformView: View {
     }
 }
 
-// MARK: - Blue Cursor Spinner
+// MARK: - Cursor Spinner
 
-/// A small blue spinning indicator that replaces the triangle cursor
-/// while the AI is processing a voice input.
+/// A small red spinning indicator that sits at the bottom-right corner of
+/// the koyal sprite while the AI is processing a voice input. Scaled down
+/// from the previous cursor-replacement version so it reads as a badge
+/// rather than taking over the whole companion.
 private struct BlueCursorSpinnerView: View {
     @State private var isSpinning = false
 
@@ -755,16 +1192,16 @@ private struct BlueCursorSpinnerView: View {
             .stroke(
                 AngularGradient(
                     colors: [
-                        DS.Colors.overlayCursorBlue.opacity(0.0),
-                        DS.Colors.overlayCursorBlue
+                        DS.Colors.overlayCursorRed.opacity(0.0),
+                        DS.Colors.overlayCursorRed
                     ],
                     center: .center
                 ),
-                style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
+                style: StrokeStyle(lineWidth: 2.0, lineCap: .round)
             )
-            .frame(width: 14, height: 14)
+            .frame(width: 11, height: 11)
             .rotationEffect(.degrees(isSpinning ? 360 : 0))
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: DS.Colors.overlayCursorRed.opacity(0.6), radius: 5, x: 0, y: 0)
             .onAppear {
                 withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
                     isSpinning = true

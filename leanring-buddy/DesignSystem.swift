@@ -143,6 +143,10 @@ enum DS {
         /// (screen overlay vs in-app UI).
         static let overlayCursorBlue = Color(hex: "#3380FF")
 
+        /// Red counterpart to `overlayCursorBlue`, used by the listening
+        /// waveform so it reads as "recording" rather than idle.
+        static let overlayCursorRed = Color(hex: "#FF3B3B")
+
         // ── Floating Button Gradient ─────────────────────────────────
 
         /// The floating session button gradient colors (unchanged from original —
@@ -848,6 +852,104 @@ extension View {
 }
 
 // MARK: - Color Utilities
+
+// MARK: - Pixel Font
+
+extension Font {
+    /// The Pokemon Diamond/Pearl/Platinum pixel font bundled with the
+    /// app. Falls back to `.system(size:weight:design:.monospaced)` if
+    /// the font file fails to load (shouldn't happen in practice since
+    /// the TTF is in the app bundle, but defensive is better than a
+    /// blank screen).
+    static func pixel(size: CGFloat) -> Font {
+        .custom("PokemonDPPt", size: size)
+    }
+}
+
+// MARK: - Pokemon Dialogue Box
+
+/// A Pokemon-style dialogue box background with stepped pixel corners
+/// and a double-border. Draws the same stepped-corner pattern the
+/// Pokemon Diamond/Pearl games use for NPC dialogue: dark fill, light
+/// inner border, darker outer border, with each corner cut as a small
+/// pixel step instead of a smooth radius.
+struct PixelDialogueBoxBackground: View {
+    var fillColor: Color = DS.Colors.surface1.opacity(0.97)
+    var borderColor: Color = Color.white.opacity(0.55)
+    var outerBorderColor: Color = Color.white.opacity(0.15)
+    var pixelSize: CGFloat = 3
+
+    var body: some View {
+        ZStack {
+            // Outer border layer (1px inset from the full frame)
+            PixelSteppedRect(pixelSize: pixelSize)
+                .fill(outerBorderColor)
+            // Main fill with inner border
+            PixelSteppedRect(pixelSize: pixelSize)
+                .fill(fillColor)
+                .padding(pixelSize)
+            // Inner highlight border
+            PixelSteppedRect(pixelSize: pixelSize)
+                .stroke(borderColor, lineWidth: pixelSize * 0.8)
+                .padding(pixelSize)
+        }
+        .shadow(color: .black.opacity(0.5), radius: 12, x: 0, y: 6)
+    }
+}
+
+/// A rectangle with stepped (pixelated) corners. Each corner is cut
+/// as a staircase: instead of a smooth arc, the corner advances one
+/// `pixelSize` step at a time, giving the distinctive retro / 8-bit
+/// dialogue box look.
+struct PixelSteppedRect: Shape {
+    var pixelSize: CGFloat = 3
+    /// How many pixel steps the corner spans. 2 gives a small notch,
+    /// 3 gives the classic Pokemon DP look.
+    var cornerSteps: Int = 3
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let p = pixelSize
+        let s = CGFloat(cornerSteps)
+
+        // Top-left corner: step down-right
+        path.move(to: CGPoint(x: rect.minX + s * p, y: rect.minY))
+        // Top edge
+        path.addLine(to: CGPoint(x: rect.maxX - s * p, y: rect.minY))
+        // Top-right corner: step down
+        for i in 0..<cornerSteps {
+            let ci = CGFloat(cornerSteps - 1 - i)
+            path.addLine(to: CGPoint(x: rect.maxX - ci * p, y: rect.minY + CGFloat(i) * p))
+            path.addLine(to: CGPoint(x: rect.maxX - ci * p, y: rect.minY + CGFloat(i + 1) * p))
+        }
+        // Right edge
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - s * p))
+        // Bottom-right corner: step left
+        for i in 0..<cornerSteps {
+            let ci = CGFloat(i)
+            path.addLine(to: CGPoint(x: rect.maxX - ci * p, y: rect.maxY - CGFloat(cornerSteps - 1 - i) * p))
+            path.addLine(to: CGPoint(x: rect.maxX - (ci + 1) * p, y: rect.maxY - CGFloat(cornerSteps - 1 - i) * p))
+        }
+        // Bottom edge
+        path.addLine(to: CGPoint(x: rect.minX + s * p, y: rect.maxY))
+        // Bottom-left corner: step up
+        for i in 0..<cornerSteps {
+            let ci = CGFloat(cornerSteps - 1 - i)
+            path.addLine(to: CGPoint(x: rect.minX + ci * p, y: rect.maxY - CGFloat(i) * p))
+            path.addLine(to: CGPoint(x: rect.minX + ci * p, y: rect.maxY - CGFloat(i + 1) * p))
+        }
+        // Left edge
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + s * p))
+        // Top-left corner: step right
+        for i in 0..<cornerSteps {
+            let ci = CGFloat(i)
+            path.addLine(to: CGPoint(x: rect.minX + ci * p, y: rect.minY + CGFloat(cornerSteps - 1 - i) * p))
+            path.addLine(to: CGPoint(x: rect.minX + (ci + 1) * p, y: rect.minY + CGFloat(cornerSteps - 1 - i) * p))
+        }
+        path.closeSubpath()
+        return path
+    }
+}
 
 extension Color {
     /// Create a Color from a hex string like "#FF5733" or "FF5733".

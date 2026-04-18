@@ -60,6 +60,11 @@ final class AppleSpeechTranscriptionProvider: BuddyTranscriptionProvider {
 private final class AppleSpeechTranscriptionSession: NSObject, BuddyStreamingTranscriptionSession {
     let finalTranscriptFallbackDelaySeconds: TimeInterval = 1.8
 
+    /// Apple Speech framework doesn't surface an explicit end-of-turn
+    /// signal, so this remains nil. Wake-word dictation flows fall
+    /// back to the RMS silence detector when this provider is active.
+    var onTurnEndedByProvider: (() -> Void)?
+
     private let recognitionRequest: SFSpeechAudioBufferRecognitionRequest
     private var recognitionTask: SFSpeechRecognitionTask?
     private let onTranscriptUpdate: (String) -> Void

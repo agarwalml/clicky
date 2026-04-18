@@ -1,0 +1,12 @@
+{
+  "images" : [
+    {
+      "filename" : "koyal_flight_1.png",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

@@ -32,8 +32,8 @@ final class MenuBarPanelManager: NSObject {
     private var dismissPanelObserver: NSObjectProtocol?
 
     private let companionManager: CompanionManager
-    private let panelWidth: CGFloat = 320
-    private let panelHeight: CGFloat = 380
+    private let panelWidth: CGFloat = 420
+    private let panelHeight: CGFloat = 520
 
     init(companionManager: CompanionManager) {
         self.companionManager = companionManager
@@ -55,6 +55,17 @@ final class MenuBarPanelManager: NSObject {
         }
         if let observer = dismissPanelObserver {
             NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    /// Toggles the menu bar panel — shows it if hidden, hides it if shown.
+    /// Public entry point shared by the Option+Space global hotkey and the
+    /// menu bar icon click handler.
+    func togglePanel() {
+        if let panel, panel.isVisible {
+            hidePanel()
+        } else {
+            showPanel()
         }
     }
 
@@ -117,11 +128,7 @@ final class MenuBarPanelManager: NSObject {
     }
 
     @objc private func statusItemClicked() {
-        if let panel, panel.isVisible {
-            hidePanel()
-        } else {
-            showPanel()
-        }
+        togglePanel()
     }
 
     // MARK: - Panel Lifecycle

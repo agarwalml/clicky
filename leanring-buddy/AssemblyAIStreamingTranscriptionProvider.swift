@@ -19,7 +19,7 @@ struct AssemblyAIStreamingTranscriptionProviderError: LocalizedError {
 final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider {
     /// URL for the Cloudflare Worker endpoint that returns a short-lived
     /// AssemblyAI streaming token. The real API key never leaves the server.
-    private static let tokenProxyURL = "https://your-worker-name.your-subdomain.workers.dev/transcribe-token"
+    private static let tokenProxyURL = "https://clicky-proxy.ipofmehul.workers.dev/transcribe-token"
 
     let displayName = "AssemblyAI"
     let requiresSpeechRecognitionPermission = false
@@ -113,6 +113,11 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private static let explicitFinalTranscriptGracePeriodSeconds = 1.4
 
     let finalTranscriptFallbackDelaySeconds: TimeInterval = 2.8
+
+    /// Observer the manager sets when it wants to know the moment
+    /// AssemblyAI's model declares an end-of-turn, so wake-word
+    /// flows can auto-close the session without a release gesture.
+    var onTurnEndedByProvider: (() -> Void)?
 
     private let apiKey: String?
     private let temporaryToken: String?
@@ -280,6 +285,18 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
                 ?? ((self.storedTurnTranscriptsByOrder.keys.max() ?? -1) + 1)
 
             if turnMessage.end_of_turn == true || turnMessage.turn_is_formatted == true {
+                // AssemblyAI emits this branch twice per turn in
+                // practice: first with `end_of_turn: true` (unformatted
+                // transcript, the actual speech boundary) and then
+                // again with `turn_is_formatted: true` (cleaned-up
+                // transcript). Only treat the *first* — the speech
+                // boundary — as the turn-end signal. Firing twice
+                // would cause the subscriber to run twice and
+                // potentially tear down a new session that was
+                // already starting.
+                let isSpeechBoundary = turnMessage.end_of_turn == true
+                    && turnMessage.turn_is_formatted != true
+
                 self.activeTurnOrder = nil
                 self.activeTurnTranscriptText = ""
                 self.storeTurnTranscript(
@@ -287,6 +304,12 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
                     forTurnOrder: turnOrder,
                     isFormatted: turnMessage.turn_is_formatted == true
                 )
+
+                if isSpeechBoundary, let onTurnEndedByProvider = self.onTurnEndedByProvider {
+                    DispatchQueue.main.async {
+                        onTurnEndedByProvider()
+                    }
+                }
             } else {
                 self.activeTurnOrder = turnOrder
                 self.activeTurnTranscriptText = transcriptText
@@ -448,7 +471,14 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             URLQueryItem(name: "sample_rate", value: "16000"),
             URLQueryItem(name: "encoding", value: "pcm_s16le"),
             URLQueryItem(name: "format_turns", value: "true"),
-            URLQueryItem(name: "speech_model", value: "u3-rt-pro")
+            URLQueryItem(name: "speech_model", value: "u3-rt-pro"),
+            // AssemblyAI's default min-end-of-turn-silence is 160ms
+            // and the default confidence threshold is ~0.7. Those
+            // settings cut people off on brief breaths mid-sentence.
+            // Raise both so the model has to be *genuinely* confident
+            // the speaker has stopped before it declares end-of-turn.
+            URLQueryItem(name: "min_end_of_turn_silence_when_confident", value: "700"),
+            URLQueryItem(name: "end_of_turn_confidence_threshold", value: "0.85")
         ]
 
         let normalizedKeyterms = keyterms

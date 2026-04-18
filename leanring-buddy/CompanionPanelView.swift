@@ -60,7 +60,61 @@ struct CompanionPanelView: View {
 
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
-                    .frame(height: 16)
+                    .frame(height: 14)
+
+                sessionToggleRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 10)
+
+                textOnlyModeToggleRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 10)
+
+                soundEffectsToggleRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 10)
+
+                wakeWordListeningToggleRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 10)
+
+                proactiveObservationToggleRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 10)
+
+                sessionMemoryToggleRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 10)
+
+                nestToggleRow
+                    .padding(.horizontal, 16)
+            }
+
+            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                Spacer()
+                    .frame(height: 10)
 
                 dmFarzaButton
                     .padding(.horizontal, 16)
@@ -77,7 +131,7 @@ struct CompanionPanelView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
         }
-        .frame(width: 320)
+        .frame(minWidth: 420)
         .background(panelBackground)
     }
 
@@ -92,15 +146,15 @@ struct CompanionPanelView: View {
                     .frame(width: 8, height: 8)
                     .shadow(color: statusDotColor.opacity(0.6), radius: 4)
 
-                Text("Clicky")
-                    .font(.system(size: 14, weight: .semibold))
+                Text("Koko")
+                    .font(.pixel(size: 20))
                     .foregroundColor(DS.Colors.textPrimary)
             }
 
             Spacer()
 
             Text(statusText)
-                .font(.system(size: 12, weight: .medium))
+                .font(.pixel(size: 16))
                 .foregroundColor(DS.Colors.textTertiary)
 
             Button(action: {
@@ -127,23 +181,31 @@ struct CompanionPanelView: View {
     @ViewBuilder
     private var permissionsCopySection: some View {
         if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            Text("Hold Control+Option to talk.")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(DS.Colors.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Hold Control+Option to talk.")
+                    .font(.pixel(size: 16))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("Hit Option+Space to type next to Koko.")
+                    .font(.pixel(size: 16))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("Ctrl+Shift+T toggles text-only replies.")
+                    .font(.pixel(size: 16))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.allPermissionsGranted && !companionManager.hasSubmittedEmail {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Drop your email to get started.")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(DS.Colors.textSecondary)
                 Text("If I keep building this, I'll keep you in the loop.")
-                    .font(.system(size: 11))
+                    .font(.pixel(size: 14))
                     .foregroundColor(DS.Colors.textTertiary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.allPermissionsGranted {
-            Text("You're all set. Hit Start to meet Clicky.")
-                .font(.system(size: 12, weight: .medium))
+            Text("You're all set. Hit Start to meet Koko.")
+                .font(.pixel(size: 16))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.hasCompletedOnboarding {
@@ -153,25 +215,25 @@ struct CompanionPanelView: View {
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
-                Text("Some permissions were revoked. Grant all four below to keep using Clicky.")
-                    .font(.system(size: 11))
+                Text("Some permissions were revoked. Grant all four below to keep using Koko.")
+                    .font(.pixel(size: 14))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Hi, I'm Farza. This is Clicky.")
+                Text("Hi, I'm Farza. This is Koko.")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
                 Text("A side project I made for fun to help me learn stuff as I use my computer.")
-                    .font(.system(size: 11))
+                    .font(.pixel(size: 14))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text("Nothing runs in the background. Clicky will only take a screenshot when you press the hot key. So, you can give that permission in peace. If you are still sus, eh, I can't do much there champ.")
-                    .font(.system(size: 11))
+                Text("Nothing runs in the background. Koko will only take a screenshot when you press the hot key. So, you can give that permission in peace. If you are still sus, eh, I can't do much there champ.")
+                    .font(.pixel(size: 14))
                     .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -205,7 +267,7 @@ struct CompanionPanelView: View {
                         companionManager.submitEmail(emailInput)
                     }) {
                         Text("Submit")
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.pixel(size: 20))
                             .foregroundColor(DS.Colors.textOnAccent)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
@@ -225,7 +287,7 @@ struct CompanionPanelView: View {
                     companionManager.triggerOnboarding()
                 }) {
                     Text("Start")
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.pixel(size: 20))
                         .foregroundColor(DS.Colors.textOnAccent)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
@@ -268,12 +330,12 @@ struct CompanionPanelView: View {
         return HStack {
             HStack(spacing: 8) {
                 Image(systemName: "hand.raised")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
                     .frame(width: 16)
 
                 Text("Accessibility")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(DS.Colors.textSecondary)
             }
 
@@ -338,13 +400,13 @@ struct CompanionPanelView: View {
         return HStack {
             HStack(spacing: 8) {
                 Image(systemName: "rectangle.dashed.badge.record")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
                     .frame(width: 16)
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Screen Recording")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.pixel(size: 18))
                         .foregroundColor(DS.Colors.textSecondary)
 
                     Text(isGranted
@@ -395,12 +457,12 @@ struct CompanionPanelView: View {
         return HStack {
             HStack(spacing: 8) {
                 Image(systemName: "eye")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
                     .frame(width: 16)
 
                 Text("Screen Content")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(DS.Colors.textSecondary)
             }
 
@@ -441,12 +503,12 @@ struct CompanionPanelView: View {
         return HStack {
             HStack(spacing: 8) {
                 Image(systemName: "mic")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
                     .frame(width: 16)
 
                 Text("Microphone")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(DS.Colors.textSecondary)
             }
 
@@ -500,12 +562,12 @@ struct CompanionPanelView: View {
         HStack {
             HStack(spacing: 8) {
                 Image(systemName: iconName)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(isGranted ? DS.Colors.textTertiary : DS.Colors.warning)
                     .frame(width: 16)
 
                 Text(label)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(DS.Colors.textSecondary)
             }
 
@@ -545,18 +607,311 @@ struct CompanionPanelView: View {
 
 
 
+    // MARK: - Session Toggle
+
+    private var sessionToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: companionManager.isSessionActive ? "record.circle" : "stop.circle")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(companionManager.isSessionActive ? DS.Colors.overlayCursorRed : DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                Text("Session")
+                    .font(.pixel(size: 18))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.isSessionActive },
+                set: { companionManager.setSessionActive($0) }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.overlayCursorRed)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Text Only Mode Toggle
+
+    /// Toggle for text-only response mode. When on, Koko's replies
+    /// stream into a scrollable text panel next to the bird instead
+    /// of being spoken aloud via TTS. Also toggled globally via
+    /// Ctrl+Shift+T.
+    private var textOnlyModeToggleRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "text.bubble")
+                        .font(.pixel(size: 16))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Text-only replies")
+                        .font(.pixel(size: 18))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { companionManager.isTextOnlyMode },
+                    set: { companionManager.setTextOnlyMode($0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+            }
+
+            Text("Toggle anytime with Ctrl+Shift+T.")
+                .font(.pixel(size: 14))
+                .foregroundColor(DS.Colors.textTertiary)
+                .padding(.leading, 24)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Wake Word Toggle
+
+    /// Opt-in toggle for the always-on "Hey Koko" wake word listener.
+    /// Off by default — always-listening is a meaningful escalation of
+    /// the app's privacy surface and should be an explicit user choice.
+    private var wakeWordListeningToggleRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "ear")
+                        .font(.pixel(size: 16))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Always listen for \"Hey Koko\"")
+                        .font(.pixel(size: 18))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { companionManager.isWakeWordListeningEnabled },
+                    set: { companionManager.setWakeWordListeningEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+            }
+
+            Text("On-device only — audio never leaves your Mac.")
+                .font(.pixel(size: 14))
+                .foregroundColor(DS.Colors.textTertiary)
+                .padding(.leading, 24)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Sound Effects Toggle
+
+    private var soundEffectsToggleRow: some View {
+        HStack {
+            HStack(spacing: 8) {
+                Image(systemName: "speaker.wave.2")
+                    .font(.pixel(size: 16))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                Text("Sound effects")
+                    .font(.pixel(size: 18))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+
+            Spacer()
+
+            Toggle("", isOn: Binding(
+                get: { companionManager.kokoSoundEffects.isEnabled },
+                set: { companionManager.kokoSoundEffects.isEnabled = $0 }
+            ))
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .tint(DS.Colors.accent)
+            .scaleEffect(0.8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Proactive Observation Toggle
+
+    private var proactiveObservationToggleRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "eye")
+                        .font(.pixel(size: 16))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Proactive observations")
+                        .font(.pixel(size: 18))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { companionManager.kokoProactiveObserver.isEnabled },
+                    set: { companionManager.kokoProactiveObserver.isEnabled = $0 }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+            }
+
+            HStack(spacing: 6) {
+                Text("Every")
+                    .font(.pixel(size: 14))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Stepper(
+                    "\(companionManager.kokoProactiveObserver.intervalMinutes) min",
+                    value: Binding(
+                        get: { companionManager.kokoProactiveObserver.intervalMinutes },
+                        set: { companionManager.kokoProactiveObserver.intervalMinutes = $0 }
+                    ),
+                    in: 1...30
+                )
+                .font(.pixel(size: 14))
+                .foregroundColor(DS.Colors.textTertiary)
+                .labelsHidden()
+
+                Text("\(companionManager.kokoProactiveObserver.intervalMinutes) min")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+            .padding(.leading, 24)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Session Memory Toggle
+
+    private var sessionMemoryToggleRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "brain")
+                        .font(.pixel(size: 16))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Remember across sessions")
+                        .font(.pixel(size: 18))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { companionManager.kokoMemoryManager.isEnabled },
+                    set: { companionManager.kokoMemoryManager.isEnabled = $0 }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+            }
+
+            HStack(spacing: 12) {
+                Text("Stored in memory.md — local only.")
+                    .font(.pixel(size: 14))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Button(action: {
+                    companionManager.kokoMemoryManager.openMemoryFileInEditor()
+                }) {
+                    Text("Edit")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.accent)
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+            }
+            .padding(.leading, 24)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Nest Toggle
+
+    private var nestToggleRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "leaf")
+                        .font(.pixel(size: 16))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+
+                    Text("Nest when idle")
+                        .font(.pixel(size: 18))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { companionManager.kokoNest.isEnabled },
+                    set: { companionManager.kokoNest.isEnabled = $0 }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+            }
+
+            HStack(spacing: 6) {
+                Text("After")
+                    .font(.pixel(size: 14))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Stepper(
+                    "\(companionManager.kokoNest.idleMinutes) min",
+                    value: Binding(
+                        get: { companionManager.kokoNest.idleMinutes },
+                        set: { companionManager.kokoNest.idleMinutes = $0 }
+                    ),
+                    in: 1...30
+                )
+                .font(.pixel(size: 14))
+                .foregroundColor(DS.Colors.textTertiary)
+                .labelsHidden()
+
+                Text("\(companionManager.kokoNest.idleMinutes) min idle")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+            }
+            .padding(.leading, 24)
+        }
+        .padding(.vertical, 4)
+    }
+
     // MARK: - Show Clicky Cursor Toggle
 
     private var showClickyCursorToggleRow: some View {
         HStack {
             HStack(spacing: 8) {
                 Image(systemName: "cursorarrow")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(DS.Colors.textTertiary)
                     .frame(width: 16)
 
                 Text("Show Clicky")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(DS.Colors.textSecondary)
             }
 
@@ -578,12 +933,12 @@ struct CompanionPanelView: View {
         HStack {
             HStack(spacing: 8) {
                 Image(systemName: "mic.badge.waveform")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
                     .foregroundColor(DS.Colors.textTertiary)
                     .frame(width: 16)
 
                 Text("Speech to Text")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.pixel(size: 18))
                     .foregroundColor(DS.Colors.textSecondary)
             }
 
@@ -601,14 +956,14 @@ struct CompanionPanelView: View {
     private var modelPickerRow: some View {
         HStack {
             Text("Model")
-                .font(.system(size: 13, weight: .medium))
+                .font(.pixel(size: 18))
                 .foregroundColor(DS.Colors.textSecondary)
 
             Spacer()
 
             HStack(spacing: 0) {
                 modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                modelOptionButton(label: "Opus", modelID: "claude-opus-4-7")
             }
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -651,7 +1006,7 @@ struct CompanionPanelView: View {
         }) {
             HStack(spacing: 8) {
                 Image(systemName: "bubble.left.fill")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.pixel(size: 16))
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Got feedback? DM me")
@@ -688,8 +1043,8 @@ struct CompanionPanelView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "power")
                         .font(.system(size: 11, weight: .medium))
-                    Text("Quit Clicky")
-                        .font(.system(size: 12, weight: .medium))
+                    Text("Quit Koko")
+                        .font(.pixel(size: 16))
                 }
                 .foregroundColor(DS.Colors.textTertiary)
             }
@@ -706,7 +1061,7 @@ struct CompanionPanelView: View {
                         Image(systemName: "play.circle")
                             .font(.system(size: 11, weight: .medium))
                         Text("Watch Onboarding Again")
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.pixel(size: 16))
                     }
                     .foregroundColor(DS.Colors.textTertiary)
                 }

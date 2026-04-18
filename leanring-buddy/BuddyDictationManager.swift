@@ -216,6 +216,13 @@ private struct BuddyDictationDraftCallbacks {
 
 @MainActor
 final class BuddyDictationManager: NSObject, ObservableObject {
+    /// Fires whenever the active streaming transcription provider
+    /// (AssemblyAI, in practice) reports that the speaker finished a
+    /// turn. Wake-word flows subscribe to this to close the session
+    /// the instant the upstream model declares end-of-turn, instead
+    /// of waiting on the RMS silence fallback.
+    let providerReportedTurnEndPublisher = PassthroughSubject<Void, Never>()
+
     private static let defaultFinalTranscriptFallbackDelaySeconds: TimeInterval = 2.4
     private static let recordedAudioPowerHistoryLength = 44
     private static let recordedAudioPowerHistoryBaselineLevel: CGFloat = 0.02
@@ -544,6 +551,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         )
 
         self.activeTranscriptionSession = activeTranscriptionSession
+        // Forward the provider's native end-of-turn signal (if any)
+        // up to whoever's subscribed on the dictation manager, so
+        // callers like the wake-word flow in CompanionManager can
+        // auto-close the session the moment the upstream model
+        // declares the turn done — without waiting on the RMS
+        // silence fallback.
+        activeTranscriptionSession.onTurnEndedByProvider = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.handleProviderReportedTurnEnd()
+            }
+        }
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
         let inputNode = audioEngine.inputNode
@@ -557,6 +575,20 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         audioEngine.prepare()
         try audioEngine.start()
+    }
+
+    /// Called on the main actor whenever the active streaming
+    /// provider declares end-of-turn. Just publishes upward — the
+    /// subscriber (the wake-word flow in `CompanionManager`) decides
+    /// whether and how to react (Ctrl+Option push-to-talk ignores
+    /// this because the user's key release is the authoritative
+    /// end-of-turn signal for that flow).
+    private func handleProviderReportedTurnEnd() {
+        // Only publish while there's actually an active recording —
+        // stray end-of-turn messages that arrive after stop requests
+        // shouldn't re-trigger subscribers.
+        guard isActivelyRecordingAudio else { return }
+        providerReportedTurnEndPublisher.send(())
     }
 
     private func handleRecognitionError(_ error: Error) {
